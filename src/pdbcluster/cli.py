@@ -9,7 +9,8 @@ from rich.console import Console
 from rich.table import Table
 
 from .discovery import discover_entries
-from .prepare import prepare_inputs
+from .prepare import load_prepared_if_current, prepare_inputs
+from .progress import make_progress
 from .tools import bootstrap_tools, nvidia_smi_summary, resolve_tool, resolve_tools, tool_version
 from .workflows import run_pipeline
 
@@ -67,10 +68,22 @@ def prepare_cmd(
         typer.Option(help="Input directory: <data_dir>/<pdb_id>/<pdb_id>_final.cif|pdb."),
     ],
     out_dir: Annotated[Path, typer.Option(help="Output directory for prepared inputs.")],
+    redo: Annotated[
+        bool, typer.Option(help="Rebuild prepared inputs even if they already exist.")
+    ] = False,
 ) -> None:
     """Prepare sequence FASTA and native structure symlink directory."""
+    out_dir = out_dir.expanduser().resolve()
     entries = discover_entries(data_dir)
-    prepared = prepare_inputs(entries, out_dir)
+    prepared = None if redo else load_prepared_if_current(out_dir, entries)
+    if prepared is not None:
+        console.print(
+            f"Reusing existing prepared inputs for {len(prepared.entries)} entries "
+            "(use --redo to rebuild)."
+        )
+    else:
+        with make_progress() as progress:
+            prepared = prepare_inputs(entries, out_dir, progress=progress)
     console.print(
         f"Prepared {len(prepared.entries)} entries: "
         f"{prepared.fasta_path} and {prepared.structures_dir}"
@@ -111,6 +124,10 @@ def run_cmd(
     foldseek_path: Annotated[
         Path | None, typer.Option(help="Explicit foldseek binary path.")
     ] = None,
+    redo: Annotated[
+        bool,
+        typer.Option(help="Rerun every step, ignoring existing prepared inputs and outputs."),
+    ] = False,
 ) -> None:
     """Run the full sequence + structure clustering pipeline."""
     resolve_tools(tool_dir=tool_dir, mmseqs_path=mmseqs_path, foldseek_path=foldseek_path)
@@ -127,5 +144,6 @@ def run_cmd(
         mmseqs_path=mmseqs_path,
         foldseek_path=foldseek_path,
         use_gpu=not no_gpu,
+        redo=redo,
     )
     console.print(f"Wrote clustering outputs to {out_dir}")

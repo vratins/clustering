@@ -4,8 +4,12 @@ import csv
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from .discovery import Entry
+
+if TYPE_CHECKING:
+    from rich.progress import Progress
 
 
 @dataclass(frozen=True)
@@ -66,7 +70,9 @@ def extract_representative_sequence(path: Path) -> tuple[str, str]:
     return sequence, chain_id
 
 
-def prepare_inputs(entries: list[Entry], out_dir: Path) -> PreparedInputs:
+def prepare_inputs(
+    entries: list[Entry], out_dir: Path, progress: Progress | None = None
+) -> PreparedInputs:
     work_dir = out_dir / "work"
     structures_dir = work_dir / "structures"
     fasta_path = work_dir / "sequences.fasta"
@@ -74,6 +80,12 @@ def prepare_inputs(entries: list[Entry], out_dir: Path) -> PreparedInputs:
     out_dir.mkdir(parents=True, exist_ok=True)
     structures_dir.mkdir(parents=True, exist_ok=True)
     fasta_path.parent.mkdir(parents=True, exist_ok=True)
+
+    task_id = (
+        progress.add_task("Extracting sequences", total=len(entries))
+        if progress is not None
+        else None
+    )
 
     prepared: list[PreparedEntry] = []
     manifest_rows: list[dict[str, str | int]] = []
@@ -105,6 +117,11 @@ def prepare_inputs(entries: list[Entry], out_dir: Path) -> PreparedInputs:
                     "error": str(exc),
                 }
             )
+        if progress is not None and task_id is not None:
+            progress.advance(task_id)
+
+    if progress is not None and task_id is not None:
+        progress.remove_task(task_id)
 
     _write_manifest(manifest_path, manifest_rows)
     if not prepared:
@@ -117,6 +134,76 @@ def prepare_inputs(entries: list[Entry], out_dir: Path) -> PreparedInputs:
         structures_dir=structures_dir,
         manifest_path=manifest_path,
     )
+
+
+def load_prepared_if_current(out_dir: Path, entries: list[Entry]) -> PreparedInputs | None:
+    """Reload prepared inputs from disk when they already cover ``entries``.
+
+    Returns ``None`` (so the caller re-prepares from scratch) unless the manifest,
+    FASTA, and structure symlinks all exist and the set of successfully prepared
+    IDs matches the discovered entries exactly.
+    """
+    work_dir = out_dir / "work"
+    structures_dir = work_dir / "structures"
+    fasta_path = work_dir / "sequences.fasta"
+    manifest_path = out_dir / "manifest.tsv"
+    if not (manifest_path.exists() and fasta_path.exists() and structures_dir.is_dir()):
+        return None
+
+    ok_rows = [row for row in _read_manifest(manifest_path) if row.get("status") == "ok"]
+    if {row["pdb_id"] for row in ok_rows} != {entry.pdb_id for entry in entries}:
+        return None
+
+    sequences = _read_fasta(fasta_path)
+    prepared: list[PreparedEntry] = []
+    for row in ok_rows:
+        structure_path = Path(row["structure_path"])
+        if not structure_path.exists():
+            return None
+        sequence = sequences.get(row["pdb_id"], "")
+        prepared.append(
+            PreparedEntry(
+                pdb_id=row["pdb_id"],
+                source_path=Path(row["source_path"]),
+                structure_path=structure_path,
+                sequence=sequence,
+                sequence_length=int(row["sequence_length"]),
+                chain_id=row.get("chain_id", ""),
+            )
+        )
+
+    if not prepared:
+        return None
+    return PreparedInputs(
+        entries=prepared,
+        fasta_path=fasta_path,
+        structures_dir=structures_dir,
+        manifest_path=manifest_path,
+    )
+
+
+def _read_manifest(path: Path) -> list[dict[str, str]]:
+    with path.open(newline="") as handle:
+        return list(csv.DictReader(handle, delimiter="\t"))
+
+
+def _read_fasta(path: Path) -> dict[str, str]:
+    sequences: dict[str, str] = {}
+    current: str | None = None
+    chunks: list[str] = []
+    with path.open() as handle:
+        for line in handle:
+            line = line.strip()
+            if line.startswith(">"):
+                if current is not None:
+                    sequences[current] = "".join(chunks)
+                current = line[1:].strip()
+                chunks = []
+            elif line:
+                chunks.append(line)
+    if current is not None:
+        sequences[current] = "".join(chunks)
+    return sequences
 
 
 def _manifest_row(entry: PreparedEntry) -> dict[str, str | int]:
