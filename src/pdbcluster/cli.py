@@ -9,9 +9,8 @@ from rich.console import Console
 from rich.table import Table
 
 from .discovery import discover_entries
-from .prepare import load_prepared_if_current, prepare_inputs
-from .progress import make_progress
-from .tools import bootstrap_tools, nvidia_smi_summary, resolve_tool, resolve_tools, tool_version
+from .prepare import prepare_inputs
+from .tools import bootstrap_tools, nvidia_smi_summary, resolve_tool, tool_version
 from .workflows import run_pipeline
 
 app = typer.Typer(no_args_is_help=True, help="Cluster PDB/mmCIF files by sequence and structure.")
@@ -68,24 +67,12 @@ def prepare_cmd(
         typer.Option(help="Input directory: <data_dir>/<pdb_id>/<pdb_id>_final.cif|pdb."),
     ],
     out_dir: Annotated[Path, typer.Option(help="Output directory for prepared inputs.")],
-    redo: Annotated[
-        bool, typer.Option(help="Rebuild prepared inputs even if they already exist.")
-    ] = False,
 ) -> None:
     """Prepare sequence FASTA and native structure symlink directory."""
-    out_dir = out_dir.expanduser().resolve()
     entries = discover_entries(data_dir)
-    prepared = None if redo else load_prepared_if_current(out_dir, entries)
-    if prepared is not None:
-        console.print(
-            f"Reusing existing prepared inputs for {len(prepared.entries)} entries "
-            "(use --redo to rebuild)."
-        )
-    else:
-        with make_progress() as progress:
-            prepared = prepare_inputs(entries, out_dir, progress=progress)
+    prepared = prepare_inputs(entries, out_dir)
     console.print(
-        f"Prepared {len(prepared.entries)} entries: "
+        f"Prepared {len(prepared.entries)} entries / {len(prepared.chains)} chains: "
         f"{prepared.fasta_path} and {prepared.structures_dir}"
     )
 
@@ -110,6 +97,15 @@ def run_cmd(
         float, typer.Option(help="Minimum query and target structure coverage.")
     ] = 0.80,
     threads: Annotated[int, typer.Option(help="Threads for MMseqs/Foldseek.")] = 8,
+    max_seqs: Annotated[
+        int,
+        typer.Option(
+            help=(
+                "MMseqs/Foldseek --max-seqs. 0 resolves to all chains for "
+                "MMseqs and component size for Foldseek."
+            )
+        ),
+    ] = 0,
     gpu_devices: Annotated[
         str | None,
         typer.Option(help="CUDA_VISIBLE_DEVICES value, e.g. '0' or '0,1,2,3'."),
@@ -124,13 +120,8 @@ def run_cmd(
     foldseek_path: Annotated[
         Path | None, typer.Option(help="Explicit foldseek binary path.")
     ] = None,
-    redo: Annotated[
-        bool,
-        typer.Option(help="Rerun every step, ignoring existing prepared inputs and outputs."),
-    ] = False,
 ) -> None:
     """Run the full sequence + structure clustering pipeline."""
-    resolve_tools(tool_dir=tool_dir, mmseqs_path=mmseqs_path, foldseek_path=foldseek_path)
     run_pipeline(
         data_dir=data_dir,
         out_dir=out_dir,
@@ -144,6 +135,6 @@ def run_cmd(
         mmseqs_path=mmseqs_path,
         foldseek_path=foldseek_path,
         use_gpu=not no_gpu,
-        redo=redo,
+        max_seqs=max_seqs,
     )
     console.print(f"Wrote clustering outputs to {out_dir}")

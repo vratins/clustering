@@ -7,6 +7,7 @@ import shutil
 import subprocess
 import tarfile
 import tempfile
+import time
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
@@ -88,39 +89,16 @@ def nvidia_smi_summary() -> str:
     return output if output else f"nvidia-smi exited {result.returncode}"
 
 
-def build_mmseqs_cluster_cmd(
-    mmseqs: Path,
-    fasta_path: Path,
-    cluster_prefix: Path,
-    tmp_dir: Path,
-    seq_id: float,
-    seq_cov: float,
-    threads: int,
-) -> list[str]:
-    return [
-        str(mmseqs),
-        "easy-cluster",
-        str(fasta_path),
-        str(cluster_prefix),
-        str(tmp_dir),
-        "--min-seq-id",
-        str(seq_id),
-        "-c",
-        str(seq_cov),
-        "--cov-mode",
-        "0",
-        "--threads",
-        str(threads),
-    ]
-
-
 def build_mmseqs_search_cmd(
     mmseqs: Path,
     fasta_path: Path,
     output_tsv: Path,
     tmp_dir: Path,
+    seq_id: float,
+    seq_cov: float,
     threads: int,
     gpu: bool,
+    max_seqs: int,
 ) -> list[str]:
     cmd = [
         str(mmseqs),
@@ -134,6 +112,14 @@ def build_mmseqs_search_cmd(
         "--alignment-mode",
         "3",
         "-a",
+        "--min-seq-id",
+        str(seq_id),
+        "-c",
+        str(seq_cov),
+        "--cov-mode",
+        "0",
+        "--max-seqs",
+        str(max_seqs),
         "--threads",
         str(threads),
     ]
@@ -142,7 +128,7 @@ def build_mmseqs_search_cmd(
     return cmd
 
 
-def build_foldseek_cluster_cmd(
+def build_foldseek_multimercluster_cmd(
     foldseek: Path,
     structures_dir: Path,
     cluster_prefix: Path,
@@ -151,53 +137,33 @@ def build_foldseek_cluster_cmd(
     struct_cov: float,
     threads: int,
     gpu: bool,
+    max_seqs: int,
 ) -> list[str]:
     cmd = [
         str(foldseek),
-        "easy-cluster",
+        "easy-multimercluster",
         str(structures_dir),
         str(cluster_prefix),
         str(tmp_dir),
         "--alignment-type",
         "1",
-        "--tmscore-threshold",
+        "--multimer-tm-threshold",
         str(tm_threshold),
         "-c",
         str(struct_cov),
         "--cov-mode",
         "0",
+        "--monomer-include-mode",
+        "0",
+        "--min-aligned-chains",
+        "1",
+        "--max-seqs",
+        str(max_seqs),
         "--threads",
         str(threads),
     ]
     if gpu:
         cmd.extend(["--gpu", "1"])
-    return cmd
-
-
-def build_foldseek_search_cmd(
-    foldseek: Path,
-    structures_dir: Path,
-    output_tsv: Path,
-    tmp_dir: Path,
-    threads: int,
-    gpu: bool,
-) -> list[str]:
-    cmd = [
-        str(foldseek),
-        "easy-search",
-        str(structures_dir),
-        str(structures_dir),
-        str(output_tsv),
-        str(tmp_dir),
-        "--alignment-type",
-        "1",
-        "--format-output",
-        "query,target,alntmscore,qtmscore,ttmscore,lddt,prob,fident,qcov,tcov,alnlen,evalue,bits",
-        "--threads",
-        str(threads),
-    ]
-    if gpu:
-        cmd.extend(["--gpu", "1", "--prefilter-mode", "1"])
     return cmd
 
 
@@ -207,8 +173,10 @@ def run_command(
     env: dict[str, str] | None = None,
 ) -> None:
     log_path.parent.mkdir(parents=True, exist_ok=True)
+    started = time.time()
     with log_path.open("w") as log:
-        log.write("$ " + " ".join(cmd) + "\n\n")
+        log.write("$ " + " ".join(cmd) + "\n")
+        log.write(f"started_at={started:.3f}\n\n")
         log.flush()
         process = subprocess.run(
             cmd,
@@ -218,6 +186,9 @@ def run_command(
             env=env,
             check=False,
         )
+        elapsed = time.time() - started
+        log.write(f"\nexit_code={process.returncode}\n")
+        log.write(f"elapsed_seconds={elapsed:.3f}\n")
     if process.returncode != 0:
         raise RuntimeError(f"command failed with exit code {process.returncode}; see {log_path}")
 

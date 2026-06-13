@@ -1,4 +1,6 @@
+.venv/
 .tools/
 __pycache__/
 .pytest_cache/
-cluster_output/
+.ruff_cache/
+
