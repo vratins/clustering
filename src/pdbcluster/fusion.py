@@ -6,6 +6,9 @@ from collections import Counter, defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 
+import numpy as np
+from scipy.optimize import linear_sum_assignment
+
 from .discovery import normalize_item_id
 from .prepare import PreparedEntry
 
@@ -42,17 +45,15 @@ STRUCT_EDGE_FIELDS = [
     "interface_lddt",
     "source_component",
 ]
-REPORT_FIELDS = [
-    "query",
-    "target",
-    "complex_qcov",
-    "complex_tcov",
-    "complex_qtm",
-    "complex_ttm",
-    "interface_lddt",
-    "u",
-    "t",
-]
+
+# Foldseek easy-multimersearch per-complex report (fixed 9 columns):
+#   qComplex tComplex qChains tChains qTM tTM u t assId
+# Coverage / interface-LDDT are NOT in this report; they are enforced at alignment
+# time by Foldseek's -c and reported as NA in our structure edges.
+REPORT_QUERY = 0
+REPORT_TARGET = 1
+REPORT_QTM = 4
+REPORT_TTM = 5
 
 SequenceHit = tuple[float, float, float, float, str, str, int, int, float]
 ChainPair = tuple[str, str]
@@ -115,17 +116,7 @@ def collapse_sequence_edges(
     edges: dict[tuple[str, str], dict[str, str | float | int]] = {}
     for pair, hits_by_chain in pair_hits.items():
         item_a, item_b = pair
-        used_a: set[str] = set()
-        used_b: set[str] = set()
-        selected: list[SequenceHit] = []
-        for hit in sorted(hits_by_chain.values(), reverse=True):
-            _score, _identity, _qcov, _tcov, chain_a, chain_b, _len_a, _len_b, _weight = hit
-            if chain_a in used_a or chain_b in used_b:
-                continue
-            used_a.add(chain_a)
-            used_b.add(chain_b)
-            selected.append(hit)
-
+        selected = _optimal_chain_matching(hits_by_chain)
         if not selected:
             continue
         total_a = structure_lengths.get(item_a, 0)
@@ -162,6 +153,34 @@ def collapse_sequence_edges(
 
     _warn_unmatched("MMseqs chain", unmatched)
     return edges
+
+
+def _optimal_chain_matching(hits_by_chain: dict[ChainPair, SequenceHit]) -> list[SequenceHit]:
+    """Max-weight 1-to-1 chain matching between two complexes (Hungarian algorithm).
+
+    Each chain of complex A is matched to at most one chain of complex B (and vice versa),
+    maximising the total identity x min-length weight. Selected hits are returned ordered by
+    the A-side chain id for deterministic output.
+    """
+    if not hits_by_chain:
+        return []
+    chains_a = sorted({chain_a for chain_a, _chain_b in hits_by_chain})
+    chains_b = sorted({chain_b for _chain_a, chain_b in hits_by_chain})
+    index_a = {chain: i for i, chain in enumerate(chains_a)}
+    index_b = {chain: j for j, chain in enumerate(chains_b)}
+
+    cost = np.zeros((len(chains_a), len(chains_b)))
+    for (chain_a, chain_b), hit in hits_by_chain.items():
+        cost[index_a[chain_a], index_b[chain_b]] = -hit[0]  # negate weight -> max-weight matching
+
+    rows, cols = linear_sum_assignment(cost)
+    selected: list[SequenceHit] = []
+    for i, j in zip(rows, cols, strict=True):
+        hit = hits_by_chain.get((chains_a[i], chains_b[j]))
+        if hit is not None and hit[0] > 0:
+            selected.append(hit)
+    selected.sort(key=lambda hit: hit[4])
+    return selected
 
 
 def _collapse_sequence_edges_best_chain(
@@ -257,33 +276,48 @@ def sequence_components(
     return assignments
 
 
-def parse_multimer_cluster_report(
+def parse_multimersearch_report(
     path: Path,
     known_ids: set[str],
     component_id: str,
-    default_coverage: float = 1.0,
 ) -> dict[tuple[str, str], dict[str, str | float]]:
+    """Parse a Foldseek easy-multimersearch per-complex report into structure edges.
+
+    The report has a fixed 9-column layout; only the complex names (cols 0,1) and the
+    multimer TM scores (cols 4,5) are read. Coverage/LDDT are not present in this report
+    (Foldseek's -c enforces coverage during alignment) and are recorded as NA.
+    """
     edges: dict[tuple[str, str], dict[str, str | float]] = {}
     unmatched: set[str] = set()
-    for row in _read_multimer_report_rows(path, default_coverage):
-        query = _known_id(row.get("query", ""), known_ids)
-        target = _known_id(row.get("target", ""), known_ids)
+    if not path.exists():
+        return edges
+
+    with path.open(newline="") as handle:
+        rows = [row for row in csv.reader(handle, delimiter="\t") if row]
+
+    for raw in rows:
+        if len(raw) <= REPORT_TTM:
+            continue
+        if not (_is_number(raw[REPORT_QTM]) and _is_number(raw[REPORT_TTM])):
+            continue
+        query = _known_id(raw[REPORT_QUERY], known_ids)
+        target = _known_id(raw[REPORT_TARGET], known_ids)
         if query is None:
-            unmatched.add(row.get("query", ""))
+            unmatched.add(raw[REPORT_QUERY])
         if target is None:
-            unmatched.add(row.get("target", ""))
+            unmatched.add(raw[REPORT_TARGET])
         if query is None or target is None or query == target:
             continue
 
         pair = tuple(sorted((query, target)))
-        metrics = {
+        metrics: dict[str, str | float] = {
             "item_a": pair[0],
             "item_b": pair[1],
-            "complex_qtm": _fraction(row.get("complex_qtm", "0")),
-            "complex_ttm": _fraction(row.get("complex_ttm", "0")),
-            "complex_qcov": _fraction(row.get("complex_qcov", "0")),
-            "complex_tcov": _fraction(row.get("complex_tcov", "0")),
-            "interface_lddt": _fraction(row.get("interface_lddt", "0")),
+            "complex_qtm": _fraction(raw[REPORT_QTM]),
+            "complex_ttm": _fraction(raw[REPORT_TTM]),
+            "complex_qcov": "NA",
+            "complex_tcov": "NA",
+            "interface_lddt": "NA",
             "source_component": component_id,
         }
         score = min(float(metrics["complex_qtm"]), float(metrics["complex_ttm"]))
@@ -300,73 +334,12 @@ def parse_multimer_cluster_report(
     return edges
 
 
-def _read_multimer_report_rows(path: Path, default_coverage: float) -> list[dict[str, str]]:
-    if not path.exists():
-        return []
-    with path.open(newline="") as handle:
-        raw_rows = [row for row in csv.reader(handle, delimiter="\t") if row]
-    if not raw_rows:
-        return []
-
-    first = raw_rows[0]
-    if set(REPORT_FIELDS[:2]).issubset(first):
-        return [dict(zip(first, row, strict=False)) for row in raw_rows[1:]]
-
-    rows: list[dict[str, str]] = []
-    for raw in raw_rows:
-        if len(raw) < 9:
-            continue
-        if _is_number(raw[2]) and _is_number(raw[3]):
-            rows.append(dict(zip(REPORT_FIELDS, raw, strict=False)))
-        else:
-            rows.append(
-                {
-                    "query": raw[0],
-                    "target": raw[1],
-                    "complex_qcov": str(default_coverage),
-                    "complex_tcov": str(default_coverage),
-                    "complex_qtm": raw[4],
-                    "complex_ttm": raw[5],
-                    "interface_lddt": "0",
-                    "u": raw[6],
-                    "t": raw[7],
-                }
-            )
-    return rows
-
-
 def write_structure_edges(path: Path, edges: dict[tuple[str, str], dict[str, str | float]]) -> None:
     _write_rows(path, STRUCT_EDGE_FIELDS, edges.values())
 
 
 def load_structure_edges(path: Path) -> dict[tuple[str, str], dict[str, str | float]]:
     return _load_edge_table(path, STRUCT_EDGE_FIELDS)
-
-
-def load_cluster_assignments(paths: list[Path], known_ids: set[str]) -> dict[str, str]:
-    assignments = {item_id: item_id for item_id in known_ids}
-    unmatched: set[str] = set()
-    for path in paths:
-        if not path.exists():
-            continue
-        with path.open() as handle:
-            for line in handle:
-                line = line.strip()
-                if not line:
-                    continue
-                parts = line.split("\t")
-                if len(parts) < 2:
-                    continue
-                rep = _known_id(parts[0], known_ids)
-                member = _known_id(parts[1], known_ids)
-                if rep is None:
-                    unmatched.add(parts[0])
-                if member is None:
-                    unmatched.add(parts[1])
-                if rep is not None and member is not None:
-                    assignments[member] = rep
-    _warn_unmatched("Foldseek cluster", unmatched)
-    return assignments
 
 
 def fuse_edges(
@@ -376,7 +349,6 @@ def fuse_edges(
     out_dir: Path,
     thresholds: FusionThresholds,
     sequence_component_by_item: dict[str, str] | None = None,
-    structure_cluster_by_item: dict[str, str] | None = None,
 ) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     known_ids = {entry.pdb_id for entry in entries}
@@ -384,9 +356,6 @@ def fuse_edges(
     seq_edges = load_sequence_edges(seq_edges_path)
     struct_edges = load_structure_edges(struct_edges_path)
     sequence_component_by_item = sequence_component_by_item or {
-        item_id: item_id for item_id in known_ids
-    }
-    structure_cluster_by_item = structure_cluster_by_item or {
         item_id: item_id for item_id in known_ids
     }
 
@@ -408,30 +377,7 @@ def fuse_edges(
         lengths,
         passing,
         sequence_component_by_item,
-        structure_cluster_by_item,
     )
-
-
-def find_cluster_tsv(prefix: Path) -> Path:
-    candidates = [
-        prefix.with_name(prefix.name + "_cluster.tsv"),
-        prefix.with_name(prefix.name + "_clu.tsv"),
-    ]
-    candidates.extend(sorted(prefix.parent.glob(prefix.name + "*_cluster.tsv")))
-    candidates.extend(sorted(prefix.parent.glob(prefix.name + "*_clu.tsv")))
-    for candidate in candidates:
-        if candidate.exists():
-            return candidate
-    return candidates[0]
-
-
-def find_cluster_report(prefix: Path) -> Path:
-    candidates = [prefix.with_name(prefix.name + "_cluster_report")]
-    candidates.extend(sorted(prefix.parent.glob(prefix.name + "*_cluster_report*")))
-    for candidate in candidates:
-        if candidate.exists():
-            return candidate
-    return candidates[0]
 
 
 def union(parent: dict[str, str], a: str, b: str) -> None:
@@ -463,8 +409,6 @@ def _passes(
         and float(seq.get("seq_complex_qcov", 1.0)) >= thresholds.complex_seq_cov
         and float(seq.get("seq_complex_tcov", 1.0)) >= thresholds.complex_seq_cov
         and min(float(struct["complex_qtm"]), float(struct["complex_ttm"])) >= thresholds.tm
-        and float(struct["complex_qcov"]) >= thresholds.struct_cov
-        and float(struct["complex_tcov"]) >= thresholds.struct_cov
     )
 
 
@@ -498,7 +442,7 @@ def _load_edge_table(
                 continue
             if key in int_fields:
                 parsed[key] = int(value)
-            elif key.endswith("chain") or key == "source_component":
+            elif key.endswith("chain") or key == "source_component" or value == "NA":
                 parsed[key] = value
             else:
                 parsed[key] = _fraction(value)
@@ -557,7 +501,6 @@ def _write_final_clusters(
     lengths: dict[str, int],
     passing_edges: list[dict[str, str | float | int]],
     sequence_component_by_item: dict[str, str],
-    structure_cluster_by_item: dict[str, str],
 ) -> None:
     members_by_root: dict[str, list[str]] = defaultdict(list)
     for item_id in sorted(known_ids):
@@ -580,7 +523,6 @@ def _write_final_clusters(
             "final_cluster",
             "final_representative",
             "sequence_component",
-            "structure_cluster",
             "sequence_length",
         ]
         writer = csv.DictWriter(handle, fieldnames=fieldnames, delimiter="\t")
@@ -596,7 +538,6 @@ def _write_final_clusters(
                         "final_cluster": cluster_ids[root],
                         "final_representative": representative,
                         "sequence_component": sequence_component_by_item.get(item_id, item_id),
-                        "structure_cluster": structure_cluster_by_item.get(item_id, item_id),
                         "sequence_length": lengths[item_id],
                     }
                 )

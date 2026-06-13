@@ -128,10 +128,11 @@ def build_mmseqs_search_cmd(
     return cmd
 
 
-def build_foldseek_multimercluster_cmd(
+def build_foldseek_multimersearch_cmd(
     foldseek: Path,
-    structures_dir: Path,
-    cluster_prefix: Path,
+    query_dir: Path,
+    target_dir: Path,
+    out_prefix: Path,
     tmp_dir: Path,
     tm_threshold: float,
     struct_cov: float,
@@ -139,11 +140,19 @@ def build_foldseek_multimercluster_cmd(
     gpu: bool,
     max_seqs: int,
 ) -> list[str]:
+    """All-vs-all multimer structural search within one sequence component.
+
+    Writes a per-complex report at ``<out_prefix>_report`` (fixed 9 columns:
+    qComplex tComplex qChains tChains qTM tTM u t assId). Coverage is enforced at
+    alignment time via ``-c`` and is not present in the report. ``--min-aligned-chains 1``
+    and ``--monomer-include-mode 0`` allow monomer and monomer-vs-multimer pairs.
+    """
     cmd = [
         str(foldseek),
-        "easy-multimercluster",
-        str(structures_dir),
-        str(cluster_prefix),
+        "easy-multimersearch",
+        str(query_dir),
+        str(target_dir),
+        str(out_prefix),
         str(tmp_dir),
         "--alignment-type",
         "1",
@@ -161,31 +170,10 @@ def build_foldseek_multimercluster_cmd(
         str(max_seqs),
         "--threads",
         str(threads),
-        "--remove-tmp-files",
-        "0",
     ]
     if gpu:
         cmd.extend(["--gpu", "1"])
     return cmd
-
-
-def build_foldseek_multimer_report_cmd(
-    foldseek: Path,
-    query_db: Path,
-    result_db: Path,
-    report_path: Path,
-    threads: int,
-) -> list[str]:
-    return [
-        str(foldseek),
-        "createmultimerreport",
-        str(query_db),
-        str(query_db),
-        str(result_db),
-        str(report_path),
-        "--threads",
-        str(threads),
-    ]
 
 
 def run_command(

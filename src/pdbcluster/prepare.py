@@ -78,7 +78,9 @@ def extract_chain_sequences(path: Path) -> list[tuple[str, str]]:
     return chains
 
 
-def prepare_inputs(entries: list[Entry], out_dir: Path) -> PreparedInputs:
+def prepare_inputs(
+    entries: list[Entry], out_dir: Path, force: bool = False
+) -> PreparedInputs:
     work_dir = out_dir / "work"
     structures_dir = work_dir / "structures"
     fasta_path = work_dir / "chains.fasta"
@@ -89,11 +91,14 @@ def prepare_inputs(entries: list[Entry], out_dir: Path) -> PreparedInputs:
     fasta_path.parent.mkdir(parents=True, exist_ok=True)
 
     cache_params = _prepare_cache_params(entries)
-    if _prepare_cache_valid(params_path, manifest_path, fasta_path, structures_dir, cache_params):
-        return _load_prepared_inputs(manifest_path, fasta_path, structures_dir, cached=True)
-    if _prepared_outputs_match_entries(manifest_path, fasta_path, structures_dir, entries):
-        params_path.write_text(json.dumps(cache_params, indent=2, sort_keys=True) + "\n")
-        return _load_prepared_inputs(manifest_path, fasta_path, structures_dir, cached=True)
+    if not force:
+        if _prepare_cache_valid(
+            params_path, manifest_path, fasta_path, structures_dir, cache_params
+        ):
+            return _load_prepared_inputs(manifest_path, fasta_path, structures_dir, cached=True)
+        if _prepared_outputs_match_entries(manifest_path, fasta_path, structures_dir, entries):
+            params_path.write_text(json.dumps(cache_params, indent=2, sort_keys=True) + "\n")
+            return _load_prepared_inputs(manifest_path, fasta_path, structures_dir, cached=True)
 
     prepared: list[PreparedEntry] = []
     chains: list[PreparedChain] = []

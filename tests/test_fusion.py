@@ -6,8 +6,7 @@ from pdbcluster.fusion import (
     FusionThresholds,
     collapse_sequence_edges,
     fuse_edges,
-    load_cluster_assignments,
-    parse_multimer_cluster_report,
+    parse_multimersearch_report,
     sequence_components,
     write_sequence_edges,
     write_structure_edges,
@@ -30,17 +29,6 @@ def _entry(pdb_id: str, length: int) -> PreparedEntry:
         chains=(chain,),
         sequence_length=length,
     )
-
-
-def test_load_cluster_assignments_maps_members_to_representatives(tmp_path: Path) -> None:
-    path = tmp_path / "clusters.tsv"
-    path.write_text("a\tb\nc\tc\n")
-
-    assert load_cluster_assignments([path], {"a", "b", "c"}) == {
-        "a": "a",
-        "b": "a",
-        "c": "c",
-    }
 
 
 def test_sequence_edges_collapse_chain_evidence_to_structure_pairs(tmp_path: Path) -> None:
@@ -73,8 +61,7 @@ def test_sequence_edges_collapse_chain_evidence_to_structure_pairs(tmp_path: Pat
     assert edges[("a", "b")]["seq_evidence_count"] == 2
 
 
-
-def test_sequence_edges_use_greedy_complex_sequence_coverage(tmp_path: Path) -> None:
+def test_sequence_edges_use_optimal_complex_sequence_coverage(tmp_path: Path) -> None:
     seq = tmp_path / "seq.tsv"
     seq.write_text(
         "a__chain0001\tb__chain0001\t0.8\t0.9\t0.9\t100\t1e-20\t80\n"
@@ -117,35 +104,69 @@ def test_sequence_edges_use_greedy_complex_sequence_coverage(tmp_path: Path) -> 
     assert edges[("a", "b")]["seq_target_chain"] == "b__chain0001,b__chain0002"
 
 
-def test_parse_multimer_cluster_report_reads_documented_order(tmp_path: Path) -> None:
-    report = tmp_path / "structure_cluster_cluster_report"
-    report.write_text(
-        "a\tb\t0.91\t0.92\t0.71\t0.72\t0.80\t1,0,0,0,1,0,0,0,1\t0,0,0\n"
-        "b\tc\t0.50\t0.50\t0.20\t0.20\t0.10\t1,0,0,0,1,0,0,0,1\t0,0,0\n"
+def test_optimal_matching_beats_greedy_on_conflicting_chains(tmp_path: Path) -> None:
+    # Greedy would take the single best hit (a1-b1, weight 0.9*10) and block the two
+    # high-coverage hits; optimal matching keeps a1-b2 and a2-b1 for full coverage.
+    seq = tmp_path / "seq.tsv"
+    seq.write_text(
+        "a__chain0001\tb__chain0001\t0.90\t0.9\t0.9\t100\t1e-20\t80\n"
+        "a__chain0001\tb__chain0002\t0.80\t0.9\t0.9\t100\t1e-20\t80\n"
+        "a__chain0002\tb__chain0001\t0.80\t0.9\t0.9\t100\t1e-20\t80\n"
+    )
+    edges = collapse_sequence_edges(
+        seq,
+        {
+            "a__chain0001": "a",
+            "a__chain0002": "a",
+            "b__chain0001": "b",
+            "b__chain0002": "b",
+        },
+        FusionThresholds(seq_id=0.3, seq_cov=0.8, tm=0.5, struct_cov=0.8, complex_seq_cov=0.5),
+        chain_lengths={
+            "a__chain0001": 50,
+            "a__chain0002": 50,
+            "b__chain0001": 50,
+            "b__chain0002": 50,
+        },
+        structure_lengths={"a": 100, "b": 100},
     )
 
-    edges = parse_multimer_cluster_report(report, {"a", "b", "c"}, "S000001")
+    assert set(edges) == {("a", "b")}
+    # both A-chains matched -> full coverage, only achievable with the optimal assignment
+    assert edges[("a", "b")]["seq_complex_qcov"] == 1.0
+    assert edges[("a", "b")]["seq_query_chain"] == "a__chain0001,a__chain0002"
 
-    assert edges[("a", "b")]["complex_qtm"] == 0.71
-    assert edges[("a", "b")]["complex_tcov"] == 0.92
+
+def test_parse_multimersearch_report_reads_tm_columns(tmp_path: Path) -> None:
+    report = tmp_path / "search_report"
+    # 9 cols: qComplex tComplex qChains tChains qTM tTM u t assId
+    report.write_text(
+        "a\tb\tA\tA\t0.91\t0.92\t1,0,0,0,1,0,0,0,1\t0,0,0\t0\n"
+        "b\tc\tA\tA\t0.50\t0.30\t1,0,0,0,1,0,0,0,1\t0,0,0\t1\n"
+    )
+
+    edges = parse_multimersearch_report(report, {"a", "b", "c"}, "S000001")
+
+    assert edges[("a", "b")]["complex_qtm"] == 0.91
+    assert edges[("a", "b")]["complex_ttm"] == 0.92
+    assert edges[("a", "b")]["complex_qcov"] == "NA"
+    assert edges[("a", "b")]["interface_lddt"] == "NA"
     assert edges[("a", "b")]["source_component"] == "S000001"
+    assert edges[("b", "c")]["complex_ttm"] == 0.30
 
 
-def test_parse_multimer_cluster_report_reads_createmultimerreport_order(
-    tmp_path: Path,
-) -> None:
-    report = tmp_path / "structure_cluster_cluster_report"
+def test_parse_multimersearch_report_keeps_best_scoring_orientation(tmp_path: Path) -> None:
+    report = tmp_path / "search_report"
     report.write_text(
-        "a\tb\tA\tA\t0.71\t0.72\t1,0,0,0,1,0,0,0,1\t0,0,0\t0\n"
+        "a\tb\tA\tA\t0.40\t0.40\t1\t0\t0\n"
+        "b\ta\tA\tA\t0.80\t0.70\t1\t0\t0\n"
     )
 
-    edges = parse_multimer_cluster_report(
-        report, {"a", "b"}, "S000001", default_coverage=0.8
-    )
+    edges = parse_multimersearch_report(report, {"a", "b"}, "S000001")
 
-    assert edges[("a", "b")]["complex_qtm"] == 0.71
-    assert edges[("a", "b")]["complex_tcov"] == 0.8
-    assert edges[("a", "b")]["interface_lddt"] == 0.0
+    assert set(edges) == {("a", "b")}
+    best = min(float(edges[("a", "b")]["complex_qtm"]), float(edges[("a", "b")]["complex_ttm"]))
+    assert best == 0.7
 
 
 def test_fuse_edges_requires_sequence_and_structure_thresholds(tmp_path: Path) -> None:
@@ -177,9 +198,9 @@ def test_fuse_edges_requires_sequence_and_structure_thresholds(tmp_path: Path) -
             "item_b": "b",
             "complex_qtm": 0.8,
             "complex_ttm": 0.75,
-            "complex_qcov": 0.9,
-            "complex_tcov": 0.9,
-            "interface_lddt": 0.8,
+            "complex_qcov": "NA",
+            "complex_tcov": "NA",
+            "interface_lddt": "NA",
             "source_component": "S000001",
         },
         ("b", "c"): {
@@ -187,9 +208,9 @@ def test_fuse_edges_requires_sequence_and_structure_thresholds(tmp_path: Path) -
             "item_b": "c",
             "complex_qtm": 0.8,
             "complex_ttm": 0.30,
-            "complex_qcov": 0.9,
-            "complex_tcov": 0.9,
-            "interface_lddt": 0.8,
+            "complex_qcov": "NA",
+            "complex_tcov": "NA",
+            "interface_lddt": "NA",
             "source_component": "S000001",
         },
     }
@@ -205,7 +226,6 @@ def test_fuse_edges_requires_sequence_and_structure_thresholds(tmp_path: Path) -
         out_dir=tmp_path,
         thresholds=FusionThresholds(seq_id=0.3, seq_cov=0.8, tm=0.5, struct_cov=0.8),
         sequence_component_by_item={"a": "S000001", "b": "S000001", "c": "S000001"},
-        structure_cluster_by_item={"a": "a", "b": "a", "c": "c"},
     )
 
     final_edges = (tmp_path / "final_edges.tsv").read_text()
@@ -213,9 +233,10 @@ def test_fuse_edges_requires_sequence_and_structure_thresholds(tmp_path: Path) -
     assert "a\tb" in final_edges
     assert "b\tc" not in final_edges
     assert "complex_qtm" in final_edges
-    assert "a\tC000001\tb\tS000001\ta" in final_clusters
-    assert "b\tC000001\tb\tS000001\ta" in final_clusters
-    assert "c\tC000002\tc\tS000001\tc" in final_clusters
+    # final_clusters columns: pdb_id, final_cluster, final_representative, seq_component, length
+    assert "a\tC000001\tb\tS000001\t100" in final_clusters
+    assert "b\tC000001\tb\tS000001\t120" in final_clusters
+    assert "c\tC000002\tc\tS000001\t140" in final_clusters
 
 
 def test_sequence_components_keep_disconnected_groups_separate() -> None:

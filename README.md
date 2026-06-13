@@ -46,6 +46,7 @@ uv run pdbcluster run \
   --out-dir /path/to/clusters \
   --seq-id 0.30 \
   --seq-cov 0.80 \
+  --complex-seq-cov 0.50 \
   --tm 0.50 \
   --struct-cov 0.80 \
   --max-seqs 0 \
@@ -54,25 +55,41 @@ uv run pdbcluster run \
 ```
 
 The pipeline first runs MMseqs all-vs-all on chain FASTA records. Passing chain
-hits are collapsed into structure-level sequence edges, and their connected
-components gate Foldseek. Foldseek `easy-multimercluster` runs only inside
-non-singleton sequence components, with monomers included via
-`--monomer-include-mode 0` and `--min-aligned-chains 1`.
+hits are collapsed into structure-level sequence edges: for each candidate
+PDB-entry pair, chains are matched 1-to-1 with an optimal (Hungarian) assignment,
+and the pair is kept only if the matched chains cover at least `--complex-seq-cov`
+of *both* entries. This `min(qcov, tcov)` complex-coverage rule keeps assemblies of
+different stoichiometry (e.g. a monomer vs. its homo-tetramer) in separate clusters.
 
-Final fused edges require both sequence support and Foldseek multimer support.
-Final clusters are connected components of that fused graph.
+The connected components of the sequence-edge graph then gate Foldseek: structural
+comparison only runs *within* a component, so Foldseek never wastes TMalign on
+sequence-dissimilar pairs, and sequence singletons skip Foldseek entirely. Each
+component with two or more members is compared all-vs-all with a single
+`foldseek easy-multimersearch` call (`--alignment-type 1`), with monomers and
+monomer-vs-multimer pairs handled via `--monomer-include-mode 0` and
+`--min-aligned-chains 1`. Structure coverage is enforced at alignment time by
+Foldseek's `-c <struct-cov>`.
 
-`--max-seqs 0` disables tool defaults by resolving to an exhaustive value for each
-stage: total chain count for MMseqs and current sequence-component size for
-Foldseek. A positive `--max-seqs` is passed directly to both tools and should be
-treated as an approximate sensitivity/speed cap.
+A pair survives fusion only if it has **both** a sequence edge and a structure edge
+with `min(qTM, tTM) >= --tm`. Final clusters are the connected components of that
+fused graph (single linkage), giving one cluster assignment per PDB entry.
+
+`--max-seqs 0` (the default) means "never truncate": it resolves to the total chain
+count for the MMseqs search and to the current sequence-component size for each
+Foldseek search. A positive `--max-seqs` is passed directly to both tools as an
+approximate sensitivity/speed cap.
+
+Pass `--force` to ignore all cached stage outputs and recompute from scratch. Use
+`--no-gpu` to run the searches on CPU.
 
 ## Caching
 
 Tool stages write sidecar `*.params.json` files. A cached stage is reused only when
 its expected outputs exist and the cached params exactly match the current command,
 thresholds, resolved `--max-seqs`, tool version, and input fingerprint. Changing
-inputs or relevant arguments reruns the affected stage automatically.
+inputs or relevant arguments reruns the affected stage automatically; Foldseek is
+cached per sequence component, so adding new structures only recomputes the
+components they touch. Pass `--force` to bypass every cache and recompute.
 
 `pdbcluster run` prints concise progress lines as stages start, finish, hit the
 cache, skip singleton sequence components, or fail. The same events are appended
@@ -92,15 +109,19 @@ elapsed time.
 - `mmseqs/seq_edges.tsv`: raw chain-level MMseqs evidence.
 - `mmseqs/seq_edges.log`: MMseqs command, stdout/stderr, exit code, and elapsed time.
 - `mmseqs/structure_seq_edges.tsv`: passing sequence evidence collapsed to PDB-entry
-  pairs with best chain support and evidence count.
+  pairs with matched chains, complex coverage, and evidence count.
 - `foldseek/components/<Sxxxxxx>/`: per-sequence-component Foldseek work dirs,
-  including `structure_cluster.log` for Foldseek stdout/stderr.
-- `foldseek/structure_edges.tsv`: multimer structure edges parsed from Foldseek
-  `_cluster_report` files. This is sequence-gated, not a global all-vs-all
-  structure clustering.
-- `final_edges.tsv`: fused structure-level edges with sequence support summary,
-  multimer TM/coverage, interface LDDT, and source sequence component.
-- `final_clusters.tsv`: final cluster assignment per PDB entry.
+  including the component structure symlinks and `search.log` for Foldseek
+  stdout/stderr.
+- `foldseek/structure_edges.tsv`: multimer structure edges (`min(qTM, tTM)` per
+  PDB-entry pair) parsed from Foldseek `easy-multimersearch` `_report` files. This is
+  sequence-gated, not a global all-vs-all structure clustering. Coverage and
+  interface LDDT are recorded as `NA` (Foldseek's `-c` enforces coverage during
+  alignment; it does not emit per-complex coverage in this report).
+- `final_edges.tsv`: fused edges that cleared both sequence and structure thresholds,
+  with the sequence-support summary, multimer TM scores, and source sequence component.
+- `final_clusters.tsv`: final cluster assignment per PDB entry — columns `pdb_id`,
+  `final_cluster`, `final_representative`, `sequence_component`, `sequence_length`.
 - `run_manifest.json`: commands run, versions, config, counts, and elapsed time.
 
 ## Download PDB-REDO Data

@@ -100,8 +100,8 @@ def run_cmd(
         float,
         typer.Option(
             help=(
-                "Minimum fraction of each PDB entry covered by greedy non-overlapping "
-                "matched sequence chains before Foldseek gating."
+                "Minimum fraction of each PDB entry covered by optimally matched "
+                "non-overlapping sequence chains before Foldseek gating."
             )
         ),
     ] = 0.50,
@@ -109,15 +109,16 @@ def run_cmd(
     max_seqs: Annotated[
         int,
         typer.Option(
-            help="MMseqs --max-seqs for chain search. 0 resolves to all prepared chains."
+            help=(
+                "Max results per query passing the prefilter, for both tools. 0 means "
+                "never truncate (= all chains for MMseqs, = component size for Foldseek)."
+            )
         ),
     ] = 0,
-    foldseek_max_seqs: Annotated[
-        int,
-        typer.Option(
-            help="Foldseek --max-seqs per sequence component. 0 uses Foldseek default 300."
-        ),
-    ] = 300,
+    force: Annotated[
+        bool,
+        typer.Option(help="Ignore cached stage outputs and recompute everything."),
+    ] = False,
     gpu_devices: Annotated[
         str | None,
         typer.Option(help="CUDA_VISIBLE_DEVICES value, e.g. '0' or '0,1,2,3'."),
@@ -149,6 +150,6 @@ def run_cmd(
         foldseek_path=foldseek_path,
         use_gpu=not no_gpu,
         max_seqs=max_seqs,
-        foldseek_max_seqs=foldseek_max_seqs,
+        force=force,
     )
     console.print(f"Wrote clustering outputs to {out_dir}")

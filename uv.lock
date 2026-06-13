@@ -384,6 +384,7 @@ source = { editable = "." }
 dependencies = [
     { name = "biotite" },
     { name = "rich" },
+    { name = "scipy" },
     { name = "typer" },
 ]
 
@@ -397,6 +398,7 @@ dev = [
 requires-dist = [
     { name = "biotite", specifier = ">=1.0" },
     { name = "rich", specifier = ">=13.7" },
+    { name = "scipy", specifier = ">=1.11" },
     { name = "typer", specifier = ">=0.12" },
 ]
 

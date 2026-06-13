@@ -13,11 +13,8 @@ from .discovery import discover_entries
 from .fusion import (
     FusionThresholds,
     collapse_sequence_edges,
-    find_cluster_report,
-    find_cluster_tsv,
     fuse_edges,
-    load_cluster_assignments,
-    parse_multimer_cluster_report,
+    parse_multimersearch_report,
     sequence_components,
     write_sequence_edges,
     write_structure_edges,
@@ -25,8 +22,7 @@ from .fusion import (
 from .prepare import PreparedEntry, PreparedInputs, prepare_inputs
 from .tools import (
     ToolPaths,
-    build_foldseek_multimer_report_cmd,
-    build_foldseek_multimercluster_cmd,
+    build_foldseek_multimersearch_cmd,
     build_mmseqs_search_cmd,
     resolve_tools,
     run_command,
@@ -74,8 +70,8 @@ def _format_progress_line(row: dict[str, object], timestamp: float) -> str:
     parts = [f"[{stamp}]", f"{stage}:{status}"]
     if message:
         parts.append(message)
-    if "component_id" in row:
-        parts.append(f"component={row['component_id']}")
+    if "component" in row:
+        parts.append(f"component={row['component']}")
     if "log_path" in row:
         parts.append(f"log={row['log_path']}")
     return " ".join(parts)
@@ -96,7 +92,7 @@ def run_pipeline(
     foldseek_path: Path | None,
     use_gpu: bool,
     max_seqs: int,
-    foldseek_max_seqs: int,
+    force: bool = False,
 ) -> None:
     started = time.time()
     out_dir = out_dir.expanduser().resolve()
@@ -112,7 +108,7 @@ def run_pipeline(
             raise RuntimeError(f"no entries found in {data_dir}")
 
         progress.event("prepare", "started")
-        prepared = prepare_inputs(entries, out_dir)
+        prepared = prepare_inputs(entries, out_dir, force=force)
         progress.event(
             "prepare",
             "cached" if prepared.cached else "done",
@@ -142,7 +138,7 @@ def run_pipeline(
             complex_seq_cov=complex_seq_cov,
         )
         command_log: list[list[str]] = []
-        sequence_component_by_item, structure_cluster_by_item = _run_tool_workflows(
+        sequence_component_by_item = _run_tool_workflows(
             prepared,
             out_dir,
             tools,
@@ -150,10 +146,10 @@ def run_pipeline(
             threads,
             use_gpu,
             max_seqs,
-            foldseek_max_seqs,
             env,
             command_log,
             progress,
+            force=force,
         )
 
         progress.event("fusion", "started")
@@ -164,7 +160,6 @@ def run_pipeline(
             out_dir=out_dir,
             thresholds=thresholds,
             sequence_component_by_item=sequence_component_by_item,
-            structure_cluster_by_item=structure_cluster_by_item,
         )
         progress.event(
             "fusion",
@@ -190,7 +185,7 @@ def run_pipeline(
                 "gpu_devices": gpu_devices or "",
                 "use_gpu": use_gpu,
                 "max_seqs": max_seqs,
-                "foldseek_max_seqs": foldseek_max_seqs,
+                "force": force,
                 "progress_path": str(progress.path),
             },
         )
@@ -212,11 +207,11 @@ def _run_tool_workflows(
     threads: int,
     use_gpu: bool,
     max_seqs: int,
-    foldseek_max_seqs: int,
     env: dict[str, str],
     command_log: list[list[str]],
     progress: ProgressTracker,
-) -> tuple[dict[str, str], dict[str, str]]:
+    force: bool = False,
+) -> dict[str, str]:
     mmseqs_dir = out_dir / "mmseqs"
     foldseek_dir = out_dir / "foldseek"
     mmseqs_dir.mkdir(exist_ok=True)
@@ -251,6 +246,7 @@ def _run_tool_workflows(
         env,
         command_log,
         progress,
+        force=force,
         max_seqs=mmseqs_max,
     )
 
@@ -273,60 +269,57 @@ def _run_tool_workflows(
     members_by_component: dict[str, list[str]] = defaultdict(list)
     for item_id, component_id in sequence_component_by_item.items():
         members_by_component[component_id].append(item_id)
-    gated_components = sum(1 for members in members_by_component.values() if len(members) > 1)
+    gated = [
+        (component_id, sorted(members))
+        for component_id, members in sorted(members_by_component.items())
+        if len(members) > 1
+    ]
     progress.event(
         "sequence_edge_collapse",
         "done",
         structure_edges=len(seq_edges),
         sequence_components=len(members_by_component),
-        foldseek_components=gated_components,
+        foldseek_components=len(gated),
         output_path=str(structure_seq_edges_path),
     )
 
     entries_by_id = {entry.pdb_id: entry for entry in prepared.entries}
     all_structure_edges: dict[tuple[str, str], dict[str, str | float]] = {}
-    cluster_paths: list[Path] = []
-    for component_id, members in sorted(members_by_component.items()):
-        if len(members) < 2:
-            progress.event(
-                "foldseek_multimercluster",
-                "skipped",
-                "singleton sequence component",
-                component_id=component_id,
-                members=sorted(members),
-            )
-            continue
-        component_entries = [entries_by_id[item_id] for item_id in sorted(members)]
+    total = len(gated)
+    for index, (component_id, members) in enumerate(gated, 1):
+        component_entries = [entries_by_id[item_id] for item_id in members]
         component_dir = foldseek_dir / "components" / component_id
         component_structures = component_dir / "structures"
         _prepare_component_structures(component_entries, component_structures)
 
-        foldseek_max = foldseek_max_seqs if foldseek_max_seqs > 0 else 300
-        cluster_prefix = component_dir / "structure_cluster"
-        report_path = cluster_prefix.with_name(cluster_prefix.name + "_cluster_report")
-        cluster_path = cluster_prefix.with_name(cluster_prefix.name + "_cluster.tsv")
-        cmd = build_foldseek_multimercluster_cmd(
+        foldseek_max = max_seqs if max_seqs > 0 else len(members)
+        out_prefix = component_dir / "search"
+        tmp_dir = component_dir / "tmp"
+        report_path = _multimersearch_report_path(out_prefix)
+        cmd = build_foldseek_multimersearch_cmd(
             tools.foldseek,
             component_structures,
-            cluster_prefix,
-            component_dir / "tmp",
+            component_structures,
+            out_prefix,
+            tmp_dir,
             thresholds.tm,
             thresholds.struct_cov,
             threads,
             use_gpu,
             foldseek_max,
         )
+        shutil.rmtree(tmp_dir, ignore_errors=True)
         _run_cached_command(
-            "foldseek_multimercluster",
+            "foldseek_multimersearch",
             f"component {component_id} over {len(component_entries)} structures",
             cmd,
-            component_dir / "structure_cluster.log",
-            component_dir / "structure_cluster.params.json",
-            [report_path, cluster_path],
+            component_dir / "search.log",
+            component_dir / "search.params.json",
+            [report_path],
             {
-                "stage": "foldseek_multimercluster",
+                "stage": "foldseek_multimersearch",
                 "component_id": component_id,
-                "members": sorted(members),
+                "members": members,
                 "command": cmd,
                 "tool_version": tool_version(tools.foldseek),
                 "input_fingerprint": _fingerprint_paths(
@@ -336,25 +329,15 @@ def _run_tool_workflows(
             env,
             command_log,
             progress,
+            force=force,
+            component=f"{index}/{total}",
             component_id=component_id,
-            members=sorted(members),
+            members=members,
             max_seqs=foldseek_max,
         )
 
-        actual_report = _ensure_multimer_report(
-            tools,
-            cluster_prefix,
-            component_dir / "tmp",
-            component_dir / "structure_cluster_report.log",
-            component_dir / "structure_cluster_report.params.json",
-            component_id,
-            threads,
-            env,
-            command_log,
-            progress,
-        )
-        for pair, edge in parse_multimer_cluster_report(
-            actual_report, known_ids, component_id, thresholds.struct_cov
+        for pair, edge in parse_multimersearch_report(
+            report_path, known_ids, component_id
         ).items():
             previous = all_structure_edges.get(pair)
             score = min(float(edge["complex_qtm"]), float(edge["complex_ttm"]))
@@ -365,11 +348,7 @@ def _run_tool_workflows(
             )
             if score > previous_score:
                 all_structure_edges[pair] = edge
-
-        actual_cluster = find_cluster_tsv(cluster_prefix)
-        if actual_cluster.exists():
-            cluster_paths.append(actual_cluster)
-        shutil.rmtree(component_dir / "tmp", ignore_errors=True)
+        shutil.rmtree(tmp_dir, ignore_errors=True)
 
     structure_edges_path = foldseek_dir / "structure_edges.tsv"
     write_structure_edges(structure_edges_path, all_structure_edges)
@@ -379,93 +358,16 @@ def _run_tool_workflows(
         structure_edges=len(all_structure_edges),
         output_path=str(structure_edges_path),
     )
-    structure_cluster_by_item = load_cluster_assignments(cluster_paths, known_ids)
-    return sequence_component_by_item, structure_cluster_by_item
+    return sequence_component_by_item
 
 
-def _ensure_multimer_report(
-    tools: ToolPaths,
-    cluster_prefix: Path,
-    tmp_dir: Path,
-    log_path: Path,
-    params_path: Path,
-    component_id: str,
-    threads: int,
-    env: dict[str, str],
-    command_log: list[list[str]],
-    progress: ProgressTracker,
-) -> Path:
-    actual_report = find_cluster_report(cluster_prefix)
-    if actual_report.exists():
-        return actual_report
-
-    report_path = cluster_prefix.with_name(cluster_prefix.name + "_cluster_report")
-    report_inputs = _find_multimer_report_inputs(tmp_dir)
-    if report_inputs is None:
-        raise RuntimeError(
-            f"Foldseek did not write a multimer cluster report for {component_id}, "
-            f"and retained report DBs were not found under {tmp_dir}: expected {report_path}"
-        )
-
-    query_db, result_db = report_inputs
-    cmd = build_foldseek_multimer_report_cmd(
-        tools.foldseek,
-        query_db,
-        result_db,
-        report_path,
-        threads,
-    )
-    _run_cached_command(
-        "foldseek_multimer_report",
-        f"component {component_id} report export",
-        cmd,
-        log_path,
-        params_path,
-        [report_path],
-        {
-            "stage": "foldseek_multimer_report",
-            "component_id": component_id,
-            "command": cmd,
-            "tool_version": tool_version(tools.foldseek),
-        },
-        env,
-        command_log,
-        progress,
-        component_id=component_id,
-    )
-
-    actual_report = find_cluster_report(cluster_prefix)
-    if not actual_report.exists():
-        raise RuntimeError(
-            f"Foldseek report export did not write a multimer cluster report for {component_id}: "
-            f"expected {actual_report}"
-        )
-    return actual_report
-
-
-def _find_multimer_report_inputs(tmp_dir: Path) -> tuple[Path, Path] | None:
-    if not tmp_dir.exists():
-        return None
-
-    candidates: list[tuple[int, Path, Path]] = []
-    for work_dir in tmp_dir.iterdir():
-        if not work_dir.is_dir():
-            continue
-        query_candidates = [work_dir / "query_pad", work_dir / "query"]
-        result_dbtypes = sorted(work_dir.glob("multimercluster_tmp/*/multimer_result.dbtype"))
-        for query_db in query_candidates:
-            query_dbtype = Path(str(query_db) + ".dbtype")
-            if not query_dbtype.exists():
-                continue
-            for result_dbtype in result_dbtypes:
-                result_db = result_dbtype.with_suffix("")
-                mtime = max(query_dbtype.stat().st_mtime_ns, result_dbtype.stat().st_mtime_ns)
-                candidates.append((mtime, query_db, result_db))
-
-    if not candidates:
-        return None
-    _mtime, query_db, result_db = max(candidates, key=lambda item: item[0])
-    return query_db, result_db
+def _multimersearch_report_path(out_prefix: Path) -> Path:
+    """Locate the per-complex report Foldseek writes next to the search output prefix."""
+    primary = out_prefix.with_name(out_prefix.name + "_report")
+    if primary.exists():
+        return primary
+    matches = sorted(out_prefix.parent.glob(out_prefix.name + "*report*"))
+    return matches[0] if matches else primary
 
 
 def _run_cached_command(
@@ -479,9 +381,10 @@ def _run_cached_command(
     env: dict[str, str],
     command_log: list[list[str]],
     progress: ProgressTracker,
+    force: bool = False,
     **extra: object,
 ) -> None:
-    if _cache_valid(params_path, output_paths, params):
+    if not force and _cache_valid(params_path, output_paths, params):
         progress.event(stage, "cached", message, log_path, **extra)
         return
 
