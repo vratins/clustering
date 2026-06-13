@@ -141,13 +141,45 @@ python download_pdb_redo.py /path/to/output \
   --polymer-entity-type "Protein (only)"
 ```
 
-To query without downloading, write one `<pdb_id>_final` stem per matching entry
-to a user-named file with `--file-list`:
+### Query without downloading
+
+Write one `<pdb_id>_final` stem per matching entry to a file. No output directory
+is needed:
 
 ```bash
-python download_pdb_redo.py /path/to/output \
+python download_pdb_redo.py \
   --file-list queried_files.txt \
-  --method "X-RAY DIFFRACTION"
+  --method "X-RAY DIFFRACTION" \
+  --max-resolution 3.0 --max-rfree 0.25 \
+  --min-residues 50 --max-residues 500 \
+  --polymer-entity-type "Protein (only)"
+```
+
+### Check an existing download directory
+
+To see which entries from the query are absent or incomplete in an existing output
+directory, use `--check-dir`. This logs a count to stderr and, combined with
+`--file-list`, writes only the missing stems to a file:
+
+```bash
+python download_pdb_redo.py \
+  --check-dir /path/to/output \
+  --file-list missing_files.txt \
+  [filter flags...]
+```
+
+### Download only the missing entries
+
+`--download-missing` (requires `--check-dir`) downloads the entries that are absent
+or incomplete. Before starting, it reads `download_manifest.tsv` from the output
+directory (if present) and skips any entries that previously failed, so interrupted
+runs can be resumed cleanly:
+
+```bash
+python download_pdb_redo.py \
+  --check-dir /path/to/output \
+  --download-missing \
+  [filter flags...]
 ```
 
 Run `python download_pdb_redo.py --help` to see the full set of knobs and defaults.

@@ -393,6 +393,23 @@ def write_file_stems(ids: Iterable[str], path: Path) -> None:
     path.write_text(text)
 
 
+def load_manifest_failures(path: Path) -> dict[str, dict]:
+    if not path.exists():
+        return {}
+    rows: dict[str, dict] = {}
+    lines = path.read_text().splitlines()
+    for line in lines[1:]:  # skip header
+        parts = line.split("\t")
+        if len(parts) >= 2 and parts[1] == "failed":
+            rows[parts[0]] = {
+                "pdb_id": parts[0],
+                "status": "failed",
+                "missing_optional": parts[2].split(",") if len(parts) > 2 and parts[2] else [],
+                "error": parts[3] if len(parts) > 3 else "",
+            }
+    return rows
+
+
 def write_manifest(results: list[dict], path: Path) -> None:
     lines = ["pdb_id\tstatus\tmissing_optional\terror"]
     for r in results:
@@ -416,8 +433,9 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument(
         "base_dir",
+        nargs="?",
         type=Path,
-        help="Base output directory. Files are saved under <base_dir>/<pdb_id>/",
+        help="Base output directory. Files are saved under <base_dir>/<pdb_id>/. Not required when --check-dir or --file-list is used.",
     )
     p.add_argument(
         "--workers",
@@ -483,6 +501,24 @@ def parse_args() -> argparse.Namespace:
         help="Exact-match polymer entity type filter.",
     )
     p.add_argument(
+        "--check-dir",
+        type=Path,
+        metavar="DIR",
+        help=(
+            "Check which entries from the query already exist (completeness check) in DIR "
+            "and log missing ones to stderr. With --file-list, writes missing stems to that "
+            "file instead of all stems. With --download-missing, downloads absent entries to DIR."
+        ),
+    )
+    p.add_argument(
+        "--download-missing",
+        action="store_true",
+        help=(
+            "Download entries absent from --check-dir. Reads an existing manifest in that "
+            "directory and skips previously-failed entries."
+        ),
+    )
+    p.add_argument(
         "--force",
         action="store_true",
         help="Redownload entries even if required output files already exist.",
@@ -495,57 +531,27 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
-def main() -> int:
-    args = parse_args()
-    base_dir: Path = args.base_dir
-    base_dir.mkdir(parents=True, exist_ok=True)
-
-    if args.page_size < 1 or args.page_size > 10000:
-        raise SystemExit("--page-size must be between 1 and 10000")
-    if args.workers < 1:
-        raise SystemExit("--workers must be >= 1")
-    if args.min_residues > args.max_residues:
-        raise SystemExit("--min-residues must be <= --max-residues")
-
-    t0 = time.time()
-    print("Querying RCSB for matching entry IDs...", file=sys.stderr)
-    query = build_query(
-        method=args.method,
-        max_resolution=args.max_resolution,
-        max_rfree=args.max_rfree,
-        min_residues=args.min_residues,
-        max_residues=args.max_residues,
-        polymer_entity_type=args.polymer_entity_type,
-    )
-    ids = fetch_all_ids(query, page_size=args.page_size)
-    print(f"Found {len(ids)} matching entries.", file=sys.stderr)
-
-    ids_path = base_dir / "ids.txt"
-    write_ids(ids, ids_path)
-    print(f"Wrote {ids_path}", file=sys.stderr)
-
-    if args.file_list is not None:
-        write_file_stems(ids, args.file_list)
-        print(f"Wrote file list {args.file_list}", file=sys.stderr)
-        print("Skipping downloads because --file-list was provided.", file=sys.stderr)
-        return 0
-
+def _run_downloads(
+    ids_to_download: list[str],
+    out_dir: Path,
+    include_pdb: bool,
+    force: bool,
+    workers: int,
+    fail_fast: bool,
+) -> tuple[list[dict], int, int, int]:
     results: list[dict] = []
     failures = 0
     downloaded = 0
     skipped = 0
+    total = len(ids_to_download)
 
-    print(
-        f"Downloading PDB-REDO ZIPs with {args.workers} worker(s)...",
-        file=sys.stderr,
-    )
-
+    print(f"Downloading PDB-REDO ZIPs with {workers} worker(s)...", file=sys.stderr)
     dl_start = time.time()
 
-    with ThreadPoolExecutor(max_workers=args.workers) as pool:
+    with ThreadPoolExecutor(max_workers=workers) as pool:
         futures = {
-            pool.submit(download_one_entry, pdb_id, base_dir, args.include_pdb, args.force): pdb_id
-            for pdb_id in ids
+            pool.submit(download_one_entry, pdb_id, out_dir, include_pdb, force): pdb_id
+            for pdb_id in ids_to_download
         }
 
         for i, fut in enumerate(as_completed(futures), start=1):
@@ -560,9 +566,9 @@ def main() -> int:
                     "missing_optional": [],
                     "error": str(exc),
                 }
-                eprint(f"[{i}/{len(ids)}] FAILED {pdb_id}: {exc}")
+                eprint(f"[{i}/{total}] FAILED {pdb_id}: {exc}")
                 results.append(result)
-                if args.fail_fast:
+                if fail_fast:
                     for pending in futures:
                         pending.cancel()
                     break
@@ -576,7 +582,7 @@ def main() -> int:
 
             elapsed_dl = time.time() - dl_start
             rate = i / elapsed_dl if elapsed_dl > 0 else 0
-            remaining = len(ids) - i
+            remaining = total - i
             eta = remaining / rate if rate > 0 else 0
             eta_str = time.strftime("%H:%M:%S", time.gmtime(eta))
 
@@ -584,10 +590,120 @@ def main() -> int:
             if result.get("missing_optional"):
                 suffix = f" (missing optional: {', '.join(result['missing_optional'])})"
             print(
-                f"[{i}/{len(ids)}] {result['status'].upper()} {pdb_id}{suffix}"
+                f"[{i}/{total}] {result['status'].upper()} {pdb_id}{suffix}"
                 f"  ({rate:.1f} entries/s, ETA {eta_str})",
                 file=sys.stderr,
             )
+
+    return results, downloaded, skipped, failures
+
+
+def main() -> int:
+    args = parse_args()
+
+    if args.page_size < 1 or args.page_size > 10000:
+        raise SystemExit("--page-size must be between 1 and 10000")
+    if args.workers < 1:
+        raise SystemExit("--workers must be >= 1")
+    if args.min_residues > args.max_residues:
+        raise SystemExit("--min-residues must be <= --max-residues")
+    if args.download_missing and not args.check_dir:
+        raise SystemExit("--download-missing requires --check-dir")
+    if args.base_dir and args.check_dir:
+        raise SystemExit("Specify either base_dir or --check-dir, not both")
+    if not args.base_dir and not args.check_dir and not args.file_list:
+        raise SystemExit("Specify base_dir, --check-dir, or --file-list")
+
+    t0 = time.time()
+    print("Querying RCSB for matching entry IDs...", file=sys.stderr)
+    query = build_query(
+        method=args.method,
+        max_resolution=args.max_resolution,
+        max_rfree=args.max_rfree,
+        min_residues=args.min_residues,
+        max_residues=args.max_residues,
+        polymer_entity_type=args.polymer_entity_type,
+    )
+    ids = fetch_all_ids(query, page_size=args.page_size)
+    print(f"Found {len(ids)} matching entries.", file=sys.stderr)
+
+    # --- Mode A: --file-list only, no --check-dir ---
+    if args.file_list and not args.check_dir:
+        write_file_stems(ids, args.file_list)
+        print(f"Wrote file list {args.file_list}", file=sys.stderr)
+        return 0
+
+    # --- Mode B: --check-dir ---
+    if args.check_dir:
+        check_dir: Path = args.check_dir
+        missing = [
+            pdb_id for pdb_id in ids
+            if not entry_is_complete(check_dir / pdb_id, pdb_id, args.include_pdb)
+        ]
+        print(
+            f"{len(missing)}/{len(ids)} entries missing or incomplete in {check_dir}",
+            file=sys.stderr,
+        )
+
+        if args.file_list:
+            write_file_stems(missing, args.file_list)
+            print(f"Wrote missing stems to {args.file_list}", file=sys.stderr)
+
+        if not args.download_missing:
+            return 0
+
+        manifest_path = check_dir / "download_manifest.tsv"
+        prev_failed = load_manifest_failures(manifest_path)
+        if prev_failed:
+            print(
+                f"Skipping {len(prev_failed)} previously-failed entries (from manifest)",
+                file=sys.stderr,
+            )
+
+        to_download = [pdb_id for pdb_id in missing if pdb_id not in prev_failed]
+        print(f"Entries to download: {len(to_download)}", file=sys.stderr)
+
+        if not to_download:
+            print("Nothing to download.", file=sys.stderr)
+            return 0
+
+        check_dir.mkdir(parents=True, exist_ok=True)
+        new_results, downloaded, skipped, failures = _run_downloads(
+            to_download, check_dir, args.include_pdb, args.force, args.workers, args.fail_fast
+        )
+
+        # Merge preserved failures with new results and write manifest.
+        all_results = list(prev_failed.values()) + new_results
+        write_manifest(all_results, manifest_path)
+
+        elapsed = time.time() - t0
+        print("", file=sys.stderr)
+        print(f"Done in {elapsed:.1f} s", file=sys.stderr)
+        print(f"To download    : {len(to_download)}", file=sys.stderr)
+        print(f"Downloaded     : {downloaded}", file=sys.stderr)
+        print(f"Skipped        : {skipped}", file=sys.stderr)
+        print(f"Failed         : {failures}", file=sys.stderr)
+        print(f"Manifest       : {manifest_path}", file=sys.stderr)
+
+        return 1 if failures else 0
+
+    # --- Mode C: base_dir positional (original behaviour) ---
+    base_dir: Path = args.base_dir
+    base_dir.mkdir(parents=True, exist_ok=True)
+
+    ids_path = base_dir / "ids.txt"
+    write_ids(ids, ids_path)
+    print(f"Wrote {ids_path}", file=sys.stderr)
+
+    if args.file_list:
+        write_file_stems(ids, args.file_list)
+        print(f"Wrote file list {args.file_list}", file=sys.stderr)
+        print("Skipping downloads because --file-list was provided.", file=sys.stderr)
+        return 0
+
+    results, downloaded, skipped, failures = _run_downloads(
+        ids, base_dir, args.include_pdb, args.force, args.workers, args.fail_fast
+    )
 
     manifest_path = base_dir / "download_manifest.tsv"
     write_manifest(results, manifest_path)
