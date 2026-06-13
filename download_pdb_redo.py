@@ -11,8 +11,9 @@ What this does
    - polymer entity type
 2. Retrieves all matching PDB entry IDs.
 3. Saves the IDs to <base_dir>/ids.txt.
-4. Downloads one PDB-REDO ZIP per entry in parallel.
-5. Extracts only the requested files into:
+4. Optionally writes a user-named list of <pdb_id>_final stems and exits.
+5. Downloads one PDB-REDO ZIP per entry in parallel.
+6. Extracts only the requested files into:
       <base_dir>/<pdb_id>/
 
 Default extracted files per entry:
@@ -386,6 +387,12 @@ def write_ids(ids: Iterable[str], path: Path) -> None:
     path.write_text(text)
 
 
+def write_file_stems(ids: Iterable[str], path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    text = "\n".join(f"{x.lower()}_final" for x in ids) + "\n"
+    path.write_text(text)
+
+
 def write_manifest(results: list[dict], path: Path) -> None:
     lines = ["pdb_id\tstatus\tmissing_optional\terror"]
     for r in results:
@@ -430,6 +437,15 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Also try to extract <pdb_id>_final.pdb when present. "
             "Missing PDB files are not treated as failures."
+        ),
+    )
+    p.add_argument(
+        "--file-list",
+        "--write-file-list",
+        type=Path,
+        help=(
+            "Write a text file containing one <pdb_id>_final stem per queried entry "
+            "and exit without downloading PDB-REDO ZIPs."
         ),
     )
     p.add_argument(
@@ -507,6 +523,12 @@ def main() -> int:
     ids_path = base_dir / "ids.txt"
     write_ids(ids, ids_path)
     print(f"Wrote {ids_path}", file=sys.stderr)
+
+    if args.file_list is not None:
+        write_file_stems(ids, args.file_list)
+        print(f"Wrote file list {args.file_list}", file=sys.stderr)
+        print("Skipping downloads because --file-list was provided.", file=sys.stderr)
+        return 0
 
     results: list[dict] = []
     failures = 0
