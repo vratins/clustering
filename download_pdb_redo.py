@@ -3,12 +3,12 @@
 
 What this does
 --------------
-1. Runs the exact RCSB Search API query for:
-   - X-RAY DIFFRACTION
-   - resolution < 3.0 A
-   - R-free < 0.25
-   - 50 <= deposited polymer residues <= 500
-   - Protein (only)
+1. Runs an RCSB Search API query with configurable filters for:
+   - experimental method
+   - resolution
+   - R-free
+   - deposited polymer residue count
+   - polymer entity type
 2. Retrieves all matching PDB entry IDs.
 3. Saves the IDs to <base_dir>/ids.txt.
 4. Downloads one PDB-REDO ZIP per entry in parallel.
@@ -38,7 +38,12 @@ Requirements
 
 Example
 -------
-python pdbredo_query_download.py /path/to/output --workers 16 --include-pdb
+python download_pdb_redo.py /path/to/output \
+    --workers 16 --include-pdb \
+    --method "X-RAY DIFFRACTION" \
+    --max-resolution 3.0 --max-rfree 0.25 \
+    --min-residues 50 --max-residues 500 \
+    --polymer-entity-type "Protein (only)"
 """
 
 from __future__ import annotations
@@ -63,68 +68,6 @@ from urllib3.util.retry import Retry
 
 RCSB_SEARCH_URL = "https://search.rcsb.org/rcsbsearch/v2/query"
 PDB_REDO_ZIP_URL = "https://pdb-redo.eu/db/{pdb_id}/zipped"
-
-# Exact query requested by the user, without request_options so we can reuse it
-# for both count and paginated-ID retrieval.
-BASE_QUERY = {
-    "return_type": "entry",
-    "query": {
-        "type": "group",
-        "logical_operator": "and",
-        "nodes": [
-            {
-                "type": "terminal",
-                "service": "text",
-                "parameters": {
-                    "attribute": "exptl.method",
-                    "operator": "exact_match",
-                    "value": "X-RAY DIFFRACTION",
-                },
-            },
-            {
-                "type": "terminal",
-                "service": "text",
-                "parameters": {
-                    "attribute": "rcsb_entry_info.resolution_combined",
-                    "operator": "less",
-                    "value": 3.0,
-                },
-            },
-            {
-                "type": "terminal",
-                "service": "text",
-                "parameters": {
-                    "attribute": "refine.ls_R_factor_R_free",
-                    "operator": "less",
-                    "value": 0.25,
-                },
-            },
-            {
-                "type": "terminal",
-                "service": "text",
-                "parameters": {
-                    "attribute": "rcsb_entry_info.deposited_polymer_monomer_count",
-                    "operator": "range",
-                    "value": {
-                        "from": 50,
-                        "to": 500,
-                        "include_lower": True,
-                        "include_upper": True,
-                    },
-                },
-            },
-            {
-                "type": "terminal",
-                "service": "text",
-                "parameters": {
-                    "attribute": "rcsb_entry_info.selected_polymer_entity_types",
-                    "operator": "exact_match",
-                    "value": "Protein (only)",
-                },
-            },
-        ],
-    },
-}
 
 PRINT_LOCK = threading.Lock()
 TLS = threading.local()
@@ -203,8 +146,78 @@ def extract_ids(result_set) -> list[str]:
     return ids
 
 
-def fetch_total_count() -> int:
-    payload = copy.deepcopy(BASE_QUERY)
+def build_query(
+    *,
+    method: str,
+    max_resolution: float,
+    max_rfree: float,
+    min_residues: int,
+    max_residues: int,
+    polymer_entity_type: str,
+) -> dict:
+    return {
+        "return_type": "entry",
+        "query": {
+            "type": "group",
+            "logical_operator": "and",
+            "nodes": [
+                {
+                    "type": "terminal",
+                    "service": "text",
+                    "parameters": {
+                        "attribute": "exptl.method",
+                        "operator": "exact_match",
+                        "value": method,
+                    },
+                },
+                {
+                    "type": "terminal",
+                    "service": "text",
+                    "parameters": {
+                        "attribute": "rcsb_entry_info.resolution_combined",
+                        "operator": "less",
+                        "value": max_resolution,
+                    },
+                },
+                {
+                    "type": "terminal",
+                    "service": "text",
+                    "parameters": {
+                        "attribute": "refine.ls_R_factor_R_free",
+                        "operator": "less",
+                        "value": max_rfree,
+                    },
+                },
+                {
+                    "type": "terminal",
+                    "service": "text",
+                    "parameters": {
+                        "attribute": "rcsb_entry_info.deposited_polymer_monomer_count",
+                        "operator": "range",
+                        "value": {
+                            "from": min_residues,
+                            "to": max_residues,
+                            "include_lower": True,
+                            "include_upper": True,
+                        },
+                    },
+                },
+                {
+                    "type": "terminal",
+                    "service": "text",
+                    "parameters": {
+                        "attribute": "rcsb_entry_info.selected_polymer_entity_types",
+                        "operator": "exact_match",
+                        "value": polymer_entity_type,
+                    },
+                },
+            ],
+        },
+    }
+
+
+def fetch_total_count(query: dict) -> int:
+    payload = copy.deepcopy(query)
     payload["request_options"] = {"return_counts": True}
     data = post_json(RCSB_SEARCH_URL, payload)
     total = data.get("total_count")
@@ -213,13 +226,13 @@ def fetch_total_count() -> int:
     return total
 
 
-def fetch_all_ids(page_size: int = 10000) -> list[str]:
-    total = fetch_total_count()
+def fetch_all_ids(query: dict, page_size: int = 10000) -> list[str]:
+    total = fetch_total_count(query)
     ids: list[str] = []
     start = 0
 
     while start < total:
-        payload = copy.deepcopy(BASE_QUERY)
+        payload = copy.deepcopy(query)
         payload["request_options"] = {
             "results_verbosity": "compact",
             "paginate": {"start": start, "rows": page_size},
@@ -391,7 +404,8 @@ def write_manifest(results: list[dict], path: Path) -> None:
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Run an RCSB query and download matching PDB-REDO entries efficiently."
+        description="Run an RCSB query and download matching PDB-REDO entries efficiently.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     p.add_argument(
         "base_dir",
@@ -419,6 +433,40 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     p.add_argument(
+        "--method",
+        default="X-RAY DIFFRACTION",
+        help="RCSB experimental method filter.",
+    )
+    p.add_argument(
+        "--max-resolution",
+        type=float,
+        default=3.0,
+        help="Maximum combined resolution in Angstrom.",
+    )
+    p.add_argument(
+        "--max-rfree",
+        type=float,
+        default=0.25,
+        help="Maximum refinement R-free value.",
+    )
+    p.add_argument(
+        "--min-residues",
+        type=int,
+        default=50,
+        help="Minimum deposited polymer monomer count.",
+    )
+    p.add_argument(
+        "--max-residues",
+        type=int,
+        default=500,
+        help="Maximum deposited polymer monomer count.",
+    )
+    p.add_argument(
+        "--polymer-entity-type",
+        default="Protein (only)",
+        help="Exact-match polymer entity type filter.",
+    )
+    p.add_argument(
         "--force",
         action="store_true",
         help="Redownload entries even if required output files already exist.",
@@ -440,10 +488,20 @@ def main() -> int:
         raise SystemExit("--page-size must be between 1 and 10000")
     if args.workers < 1:
         raise SystemExit("--workers must be >= 1")
+    if args.min_residues > args.max_residues:
+        raise SystemExit("--min-residues must be <= --max-residues")
 
     t0 = time.time()
     print("Querying RCSB for matching entry IDs...", file=sys.stderr)
-    ids = fetch_all_ids(page_size=args.page_size)
+    query = build_query(
+        method=args.method,
+        max_resolution=args.max_resolution,
+        max_rfree=args.max_rfree,
+        min_residues=args.min_residues,
+        max_residues=args.max_residues,
+        polymer_entity_type=args.polymer_entity_type,
+    )
+    ids = fetch_all_ids(query, page_size=args.page_size)
     print(f"Found {len(ids)} matching entries.", file=sys.stderr)
 
     ids_path = base_dir / "ids.txt"

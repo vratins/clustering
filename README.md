@@ -105,8 +105,19 @@ elapsed time.
 
 ## Download PDB-REDO Data
 
-The existing downloader can prepare the expected directory layout:
+The downloader accepts the RCSB search filters as command-line flags and writes the
+expected directory layout:
 
 ```bash
-python download_pdb_redo.py /path/to/output --workers 16 --include-pdb
+python download_pdb_redo.py /path/to/output \
+  --workers 16 \
+  --include-pdb \
+  --method "X-RAY DIFFRACTION" \
+  --max-resolution 3.0 \
+  --max-rfree 0.25 \
+  --min-residues 50 \
+  --max-residues 500 \
+  --polymer-entity-type "Protein (only)"
 ```
+
+Run `python download_pdb_redo.py --help` to see the full set of knobs and defaults.
