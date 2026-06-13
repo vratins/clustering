@@ -2,6 +2,7 @@ import sys
 from pathlib import Path
 
 from pdbcluster.tools import (
+    build_foldseek_multimer_report_cmd,
     build_foldseek_multimercluster_cmd,
     build_mmseqs_search_cmd,
     run_command,
@@ -39,7 +40,27 @@ def test_foldseek_multimercluster_builder_includes_monomer_safe_args() -> None:
     assert cmd[cmd.index("--monomer-include-mode") + 1] == "0"
     assert cmd[cmd.index("--min-aligned-chains") + 1] == "1"
     assert cmd[cmd.index("--max-seqs") + 1] == "7"
+    assert cmd[cmd.index("--remove-tmp-files") + 1] == "0"
     assert "--gpu" in cmd
+
+
+def test_foldseek_multimer_report_builder_exports_retained_result_db() -> None:
+    cmd = build_foldseek_multimer_report_cmd(
+        Path("foldseek"),
+        Path("tmp/123/query_pad"),
+        Path("tmp/123/multimercluster_tmp/456/multimer_result"),
+        Path("structure_cluster_cluster_report"),
+        16,
+    )
+
+    assert cmd[:2] == ["foldseek", "createmultimerreport"]
+    assert cmd[2:6] == [
+        "tmp/123/query_pad",
+        "tmp/123/query_pad",
+        "tmp/123/multimercluster_tmp/456/multimer_result",
+        "structure_cluster_cluster_report",
+    ]
+    assert cmd[cmd.index("--threads") + 1] == "16"
 
 
 def test_run_command_writes_tool_output_and_exit_metadata(tmp_path: Path) -> None:

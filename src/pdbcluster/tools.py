@@ -161,10 +161,31 @@ def build_foldseek_multimercluster_cmd(
         str(max_seqs),
         "--threads",
         str(threads),
+        "--remove-tmp-files",
+        "0",
     ]
     if gpu:
         cmd.extend(["--gpu", "1"])
     return cmd
+
+
+def build_foldseek_multimer_report_cmd(
+    foldseek: Path,
+    query_db: Path,
+    result_db: Path,
+    report_path: Path,
+    threads: int,
+) -> list[str]:
+    return [
+        str(foldseek),
+        "createmultimerreport",
+        str(query_db),
+        str(query_db),
+        str(result_db),
+        str(report_path),
+        "--threads",
+        str(threads),
+    ]
 
 
 def run_command(

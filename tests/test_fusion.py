@@ -73,6 +73,50 @@ def test_sequence_edges_collapse_chain_evidence_to_structure_pairs(tmp_path: Pat
     assert edges[("a", "b")]["seq_evidence_count"] == 2
 
 
+
+def test_sequence_edges_use_greedy_complex_sequence_coverage(tmp_path: Path) -> None:
+    seq = tmp_path / "seq.tsv"
+    seq.write_text(
+        "a__chain0001\tb__chain0001\t0.8\t0.9\t0.9\t100\t1e-20\t80\n"
+        "a__chain0002\tb__chain0002\t0.7\t0.9\t0.9\t100\t1e-20\t70\n"
+        "a__chain0003\tc__chain0001\t0.9\t0.9\t0.9\t100\t1e-20\t90\n"
+    )
+
+    edges = collapse_sequence_edges(
+        seq,
+        {
+            "a__chain0001": "a",
+            "a__chain0002": "a",
+            "a__chain0003": "a",
+            "b__chain0001": "b",
+            "b__chain0002": "b",
+            "c__chain0001": "c",
+        },
+        FusionThresholds(
+            seq_id=0.3,
+            seq_cov=0.8,
+            tm=0.5,
+            struct_cov=0.8,
+            complex_seq_cov=0.5,
+        ),
+        chain_lengths={
+            "a__chain0001": 25,
+            "a__chain0002": 25,
+            "a__chain0003": 10,
+            "b__chain0001": 25,
+            "b__chain0002": 25,
+            "c__chain0001": 100,
+        },
+        structure_lengths={"a": 100, "b": 100, "c": 100},
+    )
+
+    assert set(edges) == {("a", "b")}
+    assert edges[("a", "b")]["seq_complex_qcov"] == 0.5
+    assert edges[("a", "b")]["seq_complex_tcov"] == 0.5
+    assert edges[("a", "b")]["seq_query_chain"] == "a__chain0001,a__chain0002"
+    assert edges[("a", "b")]["seq_target_chain"] == "b__chain0001,b__chain0002"
+
+
 def test_parse_multimer_cluster_report_reads_documented_order(tmp_path: Path) -> None:
     report = tmp_path / "structure_cluster_cluster_report"
     report.write_text(
@@ -85,6 +129,23 @@ def test_parse_multimer_cluster_report_reads_documented_order(tmp_path: Path) ->
     assert edges[("a", "b")]["complex_qtm"] == 0.71
     assert edges[("a", "b")]["complex_tcov"] == 0.92
     assert edges[("a", "b")]["source_component"] == "S000001"
+
+
+def test_parse_multimer_cluster_report_reads_createmultimerreport_order(
+    tmp_path: Path,
+) -> None:
+    report = tmp_path / "structure_cluster_cluster_report"
+    report.write_text(
+        "a\tb\tA\tA\t0.71\t0.72\t1,0,0,0,1,0,0,0,1\t0,0,0\t0\n"
+    )
+
+    edges = parse_multimer_cluster_report(
+        report, {"a", "b"}, "S000001", default_coverage=0.8
+    )
+
+    assert edges[("a", "b")]["complex_qtm"] == 0.71
+    assert edges[("a", "b")]["complex_tcov"] == 0.8
+    assert edges[("a", "b")]["interface_lddt"] == 0.0
 
 
 def test_fuse_edges_requires_sequence_and_structure_thresholds(tmp_path: Path) -> None:

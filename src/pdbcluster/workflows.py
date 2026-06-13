@@ -25,6 +25,7 @@ from .fusion import (
 from .prepare import PreparedEntry, PreparedInputs, prepare_inputs
 from .tools import (
     ToolPaths,
+    build_foldseek_multimer_report_cmd,
     build_foldseek_multimercluster_cmd,
     build_mmseqs_search_cmd,
     resolve_tools,
@@ -87,6 +88,7 @@ def run_pipeline(
     seq_cov: float,
     tm_threshold: float,
     struct_cov: float,
+    complex_seq_cov: float,
     threads: int,
     gpu_devices: str | None,
     tool_dir: Path,
@@ -94,6 +96,7 @@ def run_pipeline(
     foldseek_path: Path | None,
     use_gpu: bool,
     max_seqs: int,
+    foldseek_max_seqs: int,
 ) -> None:
     started = time.time()
     out_dir = out_dir.expanduser().resolve()
@@ -112,7 +115,7 @@ def run_pipeline(
         prepared = prepare_inputs(entries, out_dir)
         progress.event(
             "prepare",
-            "done",
+            "cached" if prepared.cached else "done",
             entries=len(prepared.entries),
             chains=len(prepared.chains),
             manifest_path=str(prepared.manifest_path),
@@ -136,6 +139,7 @@ def run_pipeline(
             seq_cov=seq_cov,
             tm=tm_threshold,
             struct_cov=struct_cov,
+            complex_seq_cov=complex_seq_cov,
         )
         command_log: list[list[str]] = []
         sequence_component_by_item, structure_cluster_by_item = _run_tool_workflows(
@@ -146,6 +150,7 @@ def run_pipeline(
             threads,
             use_gpu,
             max_seqs,
+            foldseek_max_seqs,
             env,
             command_log,
             progress,
@@ -180,10 +185,12 @@ def run_pipeline(
                 "seq_cov": seq_cov,
                 "tm": tm_threshold,
                 "struct_cov": struct_cov,
+                "complex_seq_cov": complex_seq_cov,
                 "threads": threads,
                 "gpu_devices": gpu_devices or "",
                 "use_gpu": use_gpu,
                 "max_seqs": max_seqs,
+                "foldseek_max_seqs": foldseek_max_seqs,
                 "progress_path": str(progress.path),
             },
         )
@@ -205,6 +212,7 @@ def _run_tool_workflows(
     threads: int,
     use_gpu: bool,
     max_seqs: int,
+    foldseek_max_seqs: int,
     env: dict[str, str],
     command_log: list[list[str]],
     progress: ProgressTracker,
@@ -248,7 +256,15 @@ def _run_tool_workflows(
 
     progress.event("sequence_edge_collapse", "started")
     chain_to_structure = {chain.chain_uid: chain.pdb_id for chain in prepared.chains}
-    seq_edges = collapse_sequence_edges(seq_edges_path, chain_to_structure, thresholds)
+    chain_lengths = {chain.chain_uid: chain.sequence_length for chain in prepared.chains}
+    structure_lengths = {entry.pdb_id: entry.sequence_length for entry in prepared.entries}
+    seq_edges = collapse_sequence_edges(
+        seq_edges_path,
+        chain_to_structure,
+        thresholds,
+        chain_lengths=chain_lengths,
+        structure_lengths=structure_lengths,
+    )
     structure_seq_edges_path = mmseqs_dir / "structure_seq_edges.tsv"
     write_sequence_edges(structure_seq_edges_path, seq_edges)
 
@@ -285,7 +301,7 @@ def _run_tool_workflows(
         component_structures = component_dir / "structures"
         _prepare_component_structures(component_entries, component_structures)
 
-        foldseek_max = max_seqs if max_seqs > 0 else len(component_entries)
+        foldseek_max = foldseek_max_seqs if foldseek_max_seqs > 0 else 300
         cluster_prefix = component_dir / "structure_cluster"
         report_path = cluster_prefix.with_name(cluster_prefix.name + "_cluster_report")
         cluster_path = cluster_prefix.with_name(cluster_prefix.name + "_cluster.tsv")
@@ -325,14 +341,20 @@ def _run_tool_workflows(
             max_seqs=foldseek_max,
         )
 
-        actual_report = find_cluster_report(cluster_prefix)
-        if not actual_report.exists():
-            raise RuntimeError(
-                f"Foldseek did not write a multimer cluster report for {component_id}: "
-                f"expected {actual_report}"
-            )
+        actual_report = _ensure_multimer_report(
+            tools,
+            cluster_prefix,
+            component_dir / "tmp",
+            component_dir / "structure_cluster_report.log",
+            component_dir / "structure_cluster_report.params.json",
+            component_id,
+            threads,
+            env,
+            command_log,
+            progress,
+        )
         for pair, edge in parse_multimer_cluster_report(
-            actual_report, known_ids, component_id
+            actual_report, known_ids, component_id, thresholds.struct_cov
         ).items():
             previous = all_structure_edges.get(pair)
             score = min(float(edge["complex_qtm"]), float(edge["complex_ttm"]))
@@ -347,6 +369,7 @@ def _run_tool_workflows(
         actual_cluster = find_cluster_tsv(cluster_prefix)
         if actual_cluster.exists():
             cluster_paths.append(actual_cluster)
+        shutil.rmtree(component_dir / "tmp", ignore_errors=True)
 
     structure_edges_path = foldseek_dir / "structure_edges.tsv"
     write_structure_edges(structure_edges_path, all_structure_edges)
@@ -358,6 +381,91 @@ def _run_tool_workflows(
     )
     structure_cluster_by_item = load_cluster_assignments(cluster_paths, known_ids)
     return sequence_component_by_item, structure_cluster_by_item
+
+
+def _ensure_multimer_report(
+    tools: ToolPaths,
+    cluster_prefix: Path,
+    tmp_dir: Path,
+    log_path: Path,
+    params_path: Path,
+    component_id: str,
+    threads: int,
+    env: dict[str, str],
+    command_log: list[list[str]],
+    progress: ProgressTracker,
+) -> Path:
+    actual_report = find_cluster_report(cluster_prefix)
+    if actual_report.exists():
+        return actual_report
+
+    report_path = cluster_prefix.with_name(cluster_prefix.name + "_cluster_report")
+    report_inputs = _find_multimer_report_inputs(tmp_dir)
+    if report_inputs is None:
+        raise RuntimeError(
+            f"Foldseek did not write a multimer cluster report for {component_id}, "
+            f"and retained report DBs were not found under {tmp_dir}: expected {report_path}"
+        )
+
+    query_db, result_db = report_inputs
+    cmd = build_foldseek_multimer_report_cmd(
+        tools.foldseek,
+        query_db,
+        result_db,
+        report_path,
+        threads,
+    )
+    _run_cached_command(
+        "foldseek_multimer_report",
+        f"component {component_id} report export",
+        cmd,
+        log_path,
+        params_path,
+        [report_path],
+        {
+            "stage": "foldseek_multimer_report",
+            "component_id": component_id,
+            "command": cmd,
+            "tool_version": tool_version(tools.foldseek),
+        },
+        env,
+        command_log,
+        progress,
+        component_id=component_id,
+    )
+
+    actual_report = find_cluster_report(cluster_prefix)
+    if not actual_report.exists():
+        raise RuntimeError(
+            f"Foldseek report export did not write a multimer cluster report for {component_id}: "
+            f"expected {actual_report}"
+        )
+    return actual_report
+
+
+def _find_multimer_report_inputs(tmp_dir: Path) -> tuple[Path, Path] | None:
+    if not tmp_dir.exists():
+        return None
+
+    candidates: list[tuple[int, Path, Path]] = []
+    for work_dir in tmp_dir.iterdir():
+        if not work_dir.is_dir():
+            continue
+        query_candidates = [work_dir / "query_pad", work_dir / "query"]
+        result_dbtypes = sorted(work_dir.glob("multimercluster_tmp/*/multimer_result.dbtype"))
+        for query_db in query_candidates:
+            query_dbtype = Path(str(query_db) + ".dbtype")
+            if not query_dbtype.exists():
+                continue
+            for result_dbtype in result_dbtypes:
+                result_db = result_dbtype.with_suffix("")
+                mtime = max(query_dbtype.stat().st_mtime_ns, result_dbtype.stat().st_mtime_ns)
+                candidates.append((mtime, query_db, result_db))
+
+    if not candidates:
+        return None
+    _mtime, query_db, result_db = max(candidates, key=lambda item: item[0])
+    return query_db, result_db
 
 
 def _run_cached_command(

@@ -96,16 +96,28 @@ def run_cmd(
     struct_cov: Annotated[
         float, typer.Option(help="Minimum query and target structure coverage.")
     ] = 0.80,
+    complex_seq_cov: Annotated[
+        float,
+        typer.Option(
+            help=(
+                "Minimum fraction of each PDB entry covered by greedy non-overlapping "
+                "matched sequence chains before Foldseek gating."
+            )
+        ),
+    ] = 0.50,
     threads: Annotated[int, typer.Option(help="Threads for MMseqs/Foldseek.")] = 8,
     max_seqs: Annotated[
         int,
         typer.Option(
-            help=(
-                "MMseqs/Foldseek --max-seqs. 0 resolves to all chains for "
-                "MMseqs and component size for Foldseek."
-            )
+            help="MMseqs --max-seqs for chain search. 0 resolves to all prepared chains."
         ),
     ] = 0,
+    foldseek_max_seqs: Annotated[
+        int,
+        typer.Option(
+            help="Foldseek --max-seqs per sequence component. 0 uses Foldseek default 300."
+        ),
+    ] = 300,
     gpu_devices: Annotated[
         str | None,
         typer.Option(help="CUDA_VISIBLE_DEVICES value, e.g. '0' or '0,1,2,3'."),
@@ -129,6 +141,7 @@ def run_cmd(
         seq_cov=seq_cov,
         tm_threshold=tm,
         struct_cov=struct_cov,
+        complex_seq_cov=complex_seq_cov,
         threads=threads,
         gpu_devices=gpu_devices,
         tool_dir=tool_dir,
@@ -136,5 +149,6 @@ def run_cmd(
         foldseek_path=foldseek_path,
         use_gpu=not no_gpu,
         max_seqs=max_seqs,
+        foldseek_max_seqs=foldseek_max_seqs,
     )
     console.print(f"Wrote clustering outputs to {out_dir}")

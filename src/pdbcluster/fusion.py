@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import csv
 import warnings
-from collections import defaultdict
+from collections import Counter, defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -16,6 +16,7 @@ class FusionThresholds:
     seq_cov: float
     tm: float
     struct_cov: float
+    complex_seq_cov: float = 0.0
 
 
 SEQ_FIELDS = ["query", "target", "fident", "qcov", "tcov", "alnlen", "evalue", "bits"]
@@ -25,6 +26,8 @@ SEQ_EDGE_FIELDS = [
     "seq_identity",
     "seq_qcov",
     "seq_tcov",
+    "seq_complex_qcov",
+    "seq_complex_tcov",
     "seq_query_chain",
     "seq_target_chain",
     "seq_evidence_count",
@@ -51,8 +54,117 @@ REPORT_FIELDS = [
     "t",
 ]
 
+SequenceHit = tuple[float, float, float, float, str, str, int, int, float]
+ChainPair = tuple[str, str]
+StructurePair = tuple[str, str]
+
 
 def collapse_sequence_edges(
+    path: Path,
+    chain_to_structure: dict[str, str],
+    thresholds: FusionThresholds,
+    chain_lengths: dict[str, int] | None = None,
+    structure_lengths: dict[str, int] | None = None,
+) -> dict[tuple[str, str], dict[str, str | float | int]]:
+    if chain_lengths is None or structure_lengths is None:
+        return _collapse_sequence_edges_best_chain(path, chain_to_structure, thresholds)
+
+    pair_hits: dict[StructurePair, dict[ChainPair, SequenceHit]] = defaultdict(dict)
+    evidence_counts: Counter[StructurePair] = Counter()
+    unmatched: set[str] = set()
+    for row in _read_tool_tsv(path, SEQ_FIELDS):
+        query_chain = row.get("query", "")
+        target_chain = row.get("target", "")
+        query = chain_to_structure.get(query_chain)
+        target = chain_to_structure.get(target_chain)
+        if query is None:
+            unmatched.add(query_chain)
+        if target is None:
+            unmatched.add(target_chain)
+        if query is None or target is None or query == target:
+            continue
+
+        identity = _fraction(row.get("fident", "0"))
+        qcov = _fraction(row.get("qcov", "0"))
+        tcov = _fraction(row.get("tcov", "0"))
+        if identity < thresholds.seq_id or qcov < thresholds.seq_cov or tcov < thresholds.seq_cov:
+            continue
+
+        item_a, item_b = sorted((query, target))
+        if query == item_a:
+            chain_a, chain_b = query_chain, target_chain
+            qcov_ab, tcov_ab = qcov, tcov
+        else:
+            chain_a, chain_b = target_chain, query_chain
+            qcov_ab, tcov_ab = tcov, qcov
+
+        len_a = chain_lengths.get(chain_a, 0)
+        len_b = chain_lengths.get(chain_b, 0)
+        if len_a <= 0 or len_b <= 0:
+            continue
+        weight = min(len_a, len_b)
+        score = identity * weight
+        pair = (item_a, item_b)
+        chain_pair = (chain_a, chain_b)
+        evidence_counts[pair] += 1
+        hit = (score, identity, qcov_ab, tcov_ab, chain_a, chain_b, len_a, len_b, weight)
+        previous = pair_hits[pair].get(chain_pair)
+        if previous is None or hit[:2] > previous[:2]:
+            pair_hits[pair][chain_pair] = hit
+
+    edges: dict[tuple[str, str], dict[str, str | float | int]] = {}
+    for pair, hits_by_chain in pair_hits.items():
+        item_a, item_b = pair
+        used_a: set[str] = set()
+        used_b: set[str] = set()
+        selected: list[SequenceHit] = []
+        for hit in sorted(hits_by_chain.values(), reverse=True):
+            _score, _identity, _qcov, _tcov, chain_a, chain_b, _len_a, _len_b, _weight = hit
+            if chain_a in used_a or chain_b in used_b:
+                continue
+            used_a.add(chain_a)
+            used_b.add(chain_b)
+            selected.append(hit)
+
+        if not selected:
+            continue
+        total_a = structure_lengths.get(item_a, 0)
+        total_b = structure_lengths.get(item_b, 0)
+        if total_a <= 0 or total_b <= 0:
+            continue
+        complex_qcov = sum(hit[6] for hit in selected) / total_a
+        complex_tcov = sum(hit[7] for hit in selected) / total_b
+        if min(complex_qcov, complex_tcov) < thresholds.complex_seq_cov:
+            continue
+
+        identity_weight = sum(hit[8] for hit in selected)
+        seq_identity = (
+            sum(hit[1] * hit[8] for hit in selected) / identity_weight
+            if identity_weight
+            else 0.0
+        )
+        if seq_identity < thresholds.seq_id:
+            continue
+        seq_qcov = min(hit[2] for hit in selected)
+        seq_tcov = min(hit[3] for hit in selected)
+        edges[pair] = {
+            "item_a": item_a,
+            "item_b": item_b,
+            "seq_identity": seq_identity,
+            "seq_qcov": seq_qcov,
+            "seq_tcov": seq_tcov,
+            "seq_complex_qcov": complex_qcov,
+            "seq_complex_tcov": complex_tcov,
+            "seq_query_chain": ",".join(hit[4] for hit in selected),
+            "seq_target_chain": ",".join(hit[5] for hit in selected),
+            "seq_evidence_count": evidence_counts[pair],
+        }
+
+    _warn_unmatched("MMseqs chain", unmatched)
+    return edges
+
+
+def _collapse_sequence_edges_best_chain(
     path: Path,
     chain_to_structure: dict[str, str],
     thresholds: FusionThresholds,
@@ -99,6 +211,8 @@ def collapse_sequence_edges(
             "seq_identity": metrics["seq_identity"],
             "seq_qcov": qcov,
             "seq_tcov": tcov,
+            "seq_complex_qcov": 1.0,
+            "seq_complex_tcov": 1.0,
             "seq_query_chain": chain_a,
             "seq_target_chain": chain_b,
             "seq_evidence_count": evidence_count,
@@ -144,11 +258,14 @@ def sequence_components(
 
 
 def parse_multimer_cluster_report(
-    path: Path, known_ids: set[str], component_id: str
+    path: Path,
+    known_ids: set[str],
+    component_id: str,
+    default_coverage: float = 1.0,
 ) -> dict[tuple[str, str], dict[str, str | float]]:
     edges: dict[tuple[str, str], dict[str, str | float]] = {}
     unmatched: set[str] = set()
-    for row in _read_tool_tsv(path, REPORT_FIELDS):
+    for row in _read_multimer_report_rows(path, default_coverage):
         query = _known_id(row.get("query", ""), known_ids)
         target = _known_id(row.get("target", ""), known_ids)
         if query is None:
@@ -181,6 +298,41 @@ def parse_multimer_cluster_report(
 
     _warn_unmatched("Foldseek structure", unmatched)
     return edges
+
+
+def _read_multimer_report_rows(path: Path, default_coverage: float) -> list[dict[str, str]]:
+    if not path.exists():
+        return []
+    with path.open(newline="") as handle:
+        raw_rows = [row for row in csv.reader(handle, delimiter="\t") if row]
+    if not raw_rows:
+        return []
+
+    first = raw_rows[0]
+    if set(REPORT_FIELDS[:2]).issubset(first):
+        return [dict(zip(first, row, strict=False)) for row in raw_rows[1:]]
+
+    rows: list[dict[str, str]] = []
+    for raw in raw_rows:
+        if len(raw) < 9:
+            continue
+        if _is_number(raw[2]) and _is_number(raw[3]):
+            rows.append(dict(zip(REPORT_FIELDS, raw, strict=False)))
+        else:
+            rows.append(
+                {
+                    "query": raw[0],
+                    "target": raw[1],
+                    "complex_qcov": str(default_coverage),
+                    "complex_tcov": str(default_coverage),
+                    "complex_qtm": raw[4],
+                    "complex_ttm": raw[5],
+                    "interface_lddt": "0",
+                    "u": raw[6],
+                    "t": raw[7],
+                }
+            )
+    return rows
 
 
 def write_structure_edges(path: Path, edges: dict[tuple[str, str], dict[str, str | float]]) -> None:
@@ -308,6 +460,8 @@ def _passes(
         float(seq["seq_identity"]) >= thresholds.seq_id
         and float(seq["seq_qcov"]) >= thresholds.seq_cov
         and float(seq["seq_tcov"]) >= thresholds.seq_cov
+        and float(seq.get("seq_complex_qcov", 1.0)) >= thresholds.complex_seq_cov
+        and float(seq.get("seq_complex_tcov", 1.0)) >= thresholds.complex_seq_cov
         and min(float(struct["complex_qtm"]), float(struct["complex_ttm"])) >= thresholds.tm
         and float(struct["complex_qcov"]) >= thresholds.struct_cov
         and float(struct["complex_tcov"]) >= thresholds.struct_cov
@@ -367,6 +521,14 @@ def _fraction(value: str) -> float:
     if 1.0 < number <= 100.0:
         return number / 100.0
     return number
+
+
+def _is_number(value: str) -> bool:
+    try:
+        float(value)
+    except ValueError:
+        return False
+    return True
 
 
 def _write_rows(
