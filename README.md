@@ -100,8 +100,9 @@ elapsed time.
 
 ## Outputs
 
-- `manifest.tsv`: one row per extracted protein chain, including stable `chain_uid`,
-  source structure, native chain ID, sequence length, and parse status.
+- `manifest.tsv`: one row per protein chain for entries that parse successfully, one
+  row per PDB entry for parse failures. Columns: `pdb_id`, `chain_uid`, `chain_id`,
+  `source_path`, `structure_path`, `format`, `sequence_length`, `status`, `error`.
 - `work/chains.fasta`: chain-level FASTA input for MMseqs.
 - `work/structures/`: symlinks to native structure files.
 - `progress.jsonl`: append-only stage progress events; the CLI also prints these
