@@ -1,10 +1,12 @@
 import json
 from pathlib import Path
 
+import pytest
+
 from pdbcluster.fusion import FusionThresholds
 from pdbcluster.prepare import PreparedChain, PreparedEntry, PreparedInputs
 from pdbcluster.tools import ToolPaths
-from pdbcluster.workflows import ProgressTracker, _cache_valid, _run_tool_workflows
+from pdbcluster.workflows import ProgressTracker, _cache_valid, _run_tool_workflows, split_clusters
 
 THRESHOLDS = FusionThresholds(seq_id=0.3, seq_cov=0.8, tm=0.5, struct_cov=0.8)
 TOOLS = ToolPaths(mmseqs=Path("mmseqs"), foldseek=Path("foldseek"))
@@ -221,3 +223,79 @@ def test_cache_valid_requires_matching_params_and_outputs(tmp_path: Path) -> Non
     assert not _cache_valid(params_path, [tmp_path / "missing.tsv"], params)
     params_path.write_text("not-json\n")
     assert not _cache_valid(params_path, [output], params)
+
+
+# --- split_clusters tests ---
+
+
+def _write_clusters_tsv(path: Path, rows: list[tuple[str, str]]) -> None:
+    """Write a minimal final_clusters.tsv with (pdb_id, final_cluster) rows."""
+    path.write_text(
+        "pdb_id\tfinal_cluster\tfinal_representative\tsequence_component\tsequence_length\n"
+        + "".join(f"{pdb}\t{cluster}\trep\tS000001\t100\n" for pdb, cluster in rows)
+    )
+
+
+def test_split_clusters_basic_partition(tmp_path: Path) -> None:
+    # 10 singleton clusters — with seed=0 we get a deterministic shuffle
+    rows = [(f"p{i:02d}", f"C{i:06d}") for i in range(10)]
+    _write_clusters_tsv(tmp_path / "final_clusters.tsv", rows)
+
+    counts = split_clusters(tmp_path, "mydb", train=0.8, valid=0.1, test=0.1, seed=0)
+
+    train_lines = (tmp_path / "mydb_train.txt").read_text().splitlines()
+    valid_lines = (tmp_path / "mydb_valid.txt").read_text().splitlines()
+    test_lines = (tmp_path / "mydb_test.txt").read_text().splitlines()
+
+    assert counts["train"] + counts["valid"] + counts["test"] == 10
+    assert len(train_lines) == counts["train"]
+    assert len(valid_lines) == counts["valid"]
+    assert len(test_lines) == counts["test"]
+
+    # All lines end with _final
+    all_lines = train_lines + valid_lines + test_lines
+    assert all(line.endswith("_final") for line in all_lines)
+
+    # No duplicates across splits
+    assert len(set(all_lines)) == 10
+
+
+def test_split_clusters_ratio_normalization(tmp_path: Path) -> None:
+    rows = [(f"p{i:02d}", f"C{i:06d}") for i in range(10)]
+    _write_clusters_tsv(tmp_path / "final_clusters.tsv", rows)
+
+    counts_normalized = split_clusters(tmp_path, "a", train=0.8, valid=0.1, test=0.1, seed=1)
+    counts_unnormalized = split_clusters(tmp_path, "b", train=8.0, valid=1.0, test=1.0, seed=1)
+
+    assert counts_normalized == counts_unnormalized
+
+
+def test_split_clusters_large_clusters_go_to_train(tmp_path: Path) -> None:
+    # One big cluster (3 members, threshold=3 → qualifies as large), rest are singletons
+    rows = [("big0", "C000001"), ("big1", "C000001"), ("big2", "C000001")]
+    rows += [(f"s{i}", f"C{i+2:06d}") for i in range(6)]
+    _write_clusters_tsv(tmp_path / "final_clusters.tsv", rows)
+
+    counts = split_clusters(tmp_path, "x", train=0.5, valid=0.25, test=0.25, seed=0, max_cluster_size=3)
+
+    train_lines = (tmp_path / "x_train.txt").read_text().splitlines()
+    assert "big0_final" in train_lines
+    assert "big1_final" in train_lines
+    assert "big2_final" in train_lines
+    assert counts["train"] + counts["valid"] + counts["test"] == 9
+
+
+def test_split_clusters_missing_file_raises(tmp_path: Path) -> None:
+    with pytest.raises(FileNotFoundError, match="final_clusters.tsv"):
+        split_clusters(tmp_path, "x")
+
+
+def test_split_clusters_single_cluster_goes_to_train(tmp_path: Path) -> None:
+    rows = [("a", "C000001"), ("b", "C000001")]
+    _write_clusters_tsv(tmp_path / "final_clusters.tsv", rows)
+
+    counts = split_clusters(tmp_path, "s", train=0.8, valid=0.1, test=0.1, seed=0)
+
+    assert counts["train"] == 2
+    assert counts["valid"] == 0
+    assert counts["test"] == 0

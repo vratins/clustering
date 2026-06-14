@@ -82,6 +82,40 @@ approximate sensitivity/speed cap.
 Pass `--force` to ignore all cached stage outputs and recompute from scratch. Use
 `--no-gpu` to run the searches on CPU.
 
+## Split
+
+After clustering, generate train/valid/test split files from `final_clusters.tsv`:
+
+```bash
+uv run pdbcluster split \
+  --out-dir /path/to/clusters \
+  --split-name mydb \
+  --train 0.8 \
+  --valid 0.1 \
+  --test 0.1 \
+  --seed 42
+```
+
+This writes three files to `--out-dir`:
+
+- `mydb_train.txt`
+- `mydb_valid.txt`
+- `mydb_test.txt`
+
+Each line contains one PDB identifier in the form `<pdb_id>_final`.
+
+Splitting is **cluster-aware**: all members of the same cluster are always placed in
+the same split, preventing data leakage across sets. The `--train`/`--valid`/`--test`
+values are relative weights (not required to sum to 1.0, so `8 1 1` is equivalent to
+`0.8 0.1 0.1`). Weights govern distribution of entries across splits; the actual
+counts may differ slightly from the target ratios because entire clusters move
+together.
+
+Clusters with `>= --max-cluster-size` members (default 500) are unconditionally
+placed in the training set. The ratios then apply to the remaining smaller clusters.
+
+Pass `--seed` for a reproducible shuffle order.
+
 ## Caching
 
 Tool stages write sidecar `*.params.json` files. A cached stage is reused only when

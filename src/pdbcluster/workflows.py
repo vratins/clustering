@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import csv
 import hashlib
 import json
 import os
+import random
 import shutil
 import sys
 import time
@@ -462,3 +464,72 @@ def _write_run_manifest(
     (out_dir / "run_manifest.json").write_text(
         json.dumps(manifest, indent=2, sort_keys=True) + "\n"
     )
+
+
+def split_clusters(
+    out_dir: Path,
+    split_name: str,
+    train: float = 0.8,
+    valid: float = 0.1,
+    test: float = 0.1,
+    seed: int | None = None,
+    max_cluster_size: int = 500,
+) -> dict[str, int]:
+    """Partition entries from final_clusters.tsv into train/valid/test split files.
+
+    Splitting is cluster-aware: all members of a cluster go to the same split.
+    Clusters with >= max_cluster_size members are always placed in train.
+    The ratios govern distribution of the remaining smaller clusters by entry count.
+    Returns entry counts per split.
+    """
+    clusters_path = out_dir / "final_clusters.tsv"
+    if not clusters_path.exists():
+        raise FileNotFoundError(
+            f"no final_clusters.tsv found in {out_dir}; run the pipeline first"
+        )
+
+    members_by_cluster: dict[str, list[str]] = defaultdict(list)
+    with clusters_path.open(newline="") as handle:
+        for row in csv.DictReader(handle, delimiter="\t"):
+            members_by_cluster[row["final_cluster"]].append(row["pdb_id"])
+
+    ratio_total = train + valid + test
+    if ratio_total <= 0:
+        raise ValueError("train + valid + test must be positive")
+    train_frac = train / ratio_total
+    valid_frac = valid / ratio_total
+
+    small: list[str] = []
+    large: list[str] = []
+    for cluster_id, members in members_by_cluster.items():
+        (large if len(members) >= max_cluster_size else small).append(cluster_id)
+
+    random.Random(seed).shuffle(small)
+
+    total_small = sum(len(members_by_cluster[c]) for c in small)
+    train_thresh = total_small * train_frac
+    valid_thresh = total_small * (train_frac + valid_frac)
+
+    split_ids: dict[str, list[str]] = {"train": [], "valid": [], "test": []}
+
+    for cluster_id in large:
+        split_ids["train"].extend(members_by_cluster[cluster_id])
+
+    cumulative = 0
+    for cluster_id in small:
+        members = members_by_cluster[cluster_id]
+        if cumulative < train_thresh:
+            split_key = "train"
+        elif cumulative < valid_thresh:
+            split_key = "valid"
+        else:
+            split_key = "test"
+        cumulative += len(members)
+        split_ids[split_key].extend(members)
+
+    for split_key, pdb_ids in split_ids.items():
+        out_path = out_dir / f"{split_name}_{split_key}.txt"
+        lines = sorted(f"{pdb_id}_final" for pdb_id in pdb_ids)
+        out_path.write_text("\n".join(lines) + ("\n" if lines else ""))
+
+    return {key: len(ids) for key, ids in split_ids.items()}

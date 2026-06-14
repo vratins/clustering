@@ -11,7 +11,7 @@ from rich.table import Table
 from .discovery import discover_entries
 from .prepare import prepare_inputs
 from .tools import bootstrap_tools, nvidia_smi_summary, resolve_tool, tool_version
-from .workflows import run_pipeline
+from .workflows import run_pipeline, split_clusters
 
 app = typer.Typer(no_args_is_help=True, help="Cluster PDB/mmCIF files by sequence and structure.")
 console = Console()
@@ -153,3 +153,45 @@ def run_cmd(
         force=force,
     )
     console.print(f"Wrote clustering outputs to {out_dir}")
+
+
+@app.command("split")
+def split_cmd(
+    out_dir: Annotated[
+        Path, typer.Option(help="Output directory containing final_clusters.tsv.")
+    ],
+    split_name: Annotated[str, typer.Option(help="Prefix for output split files.")],
+    train: Annotated[float, typer.Option(help="Relative weight for training split.")] = 0.8,
+    valid: Annotated[
+        float, typer.Option(help="Relative weight for validation split.")
+    ] = 0.1,
+    test: Annotated[float, typer.Option(help="Relative weight for test split.")] = 0.1,
+    seed: Annotated[
+        int | None, typer.Option(help="Random seed for reproducible shuffling.")
+    ] = None,
+    max_cluster_size: Annotated[
+        int,
+        typer.Option(
+            help="Clusters with >= this many members are forced into train only."
+        ),
+    ] = 500,
+) -> None:
+    """Create train/valid/test split files from final cluster assignments.
+
+    Reads <out-dir>/final_clusters.tsv and writes three text files:
+    <out-dir>/<split-name>_train.txt, _valid.txt, _test.txt.
+    Each line is a PDB identifier of the form <pdb_id>_final.
+    Splitting is cluster-aware so all members of a cluster land in the same file.
+    """
+    counts = split_clusters(
+        out_dir,
+        split_name,
+        train=train,
+        valid=valid,
+        test=test,
+        seed=seed,
+        max_cluster_size=max_cluster_size,
+    )
+    console.print(
+        f"train={counts['train']}  valid={counts['valid']}  test={counts['test']}"
+    )
