@@ -237,7 +237,7 @@ def _write_clusters_tsv(path: Path, rows: list[tuple[str, str]]) -> None:
 
 
 def test_split_clusters_basic_partition(tmp_path: Path) -> None:
-    # 10 singleton clusters — with seed=0 we get a deterministic shuffle
+    # 10 singleton clusters; largest-first ordering puts test/valid before train
     rows = [(f"p{i:02d}", f"C{i:06d}") for i in range(10)]
     _write_clusters_tsv(tmp_path / "final_clusters.tsv", rows)
 
@@ -258,6 +258,11 @@ def test_split_clusters_basic_partition(tmp_path: Path) -> None:
 
     # No duplicates across splits
     assert len(set(all_lines)) == 10
+
+    # With 10% test and 10% valid, eval sets get ~1 entry each; train gets the rest
+    assert counts["test"] >= 1
+    assert counts["valid"] >= 1
+    assert counts["train"] >= 8
 
 
 def test_split_clusters_ratio_normalization(tmp_path: Path) -> None:
@@ -284,18 +289,53 @@ def test_split_clusters_large_clusters_go_to_train(tmp_path: Path) -> None:
     assert "big2_final" in train_lines
     assert counts["train"] + counts["valid"] + counts["test"] == 9
 
+    # Singletons below the threshold: largest-first means test/valid get filled
+    # before the remaining singletons go to train
+    assert counts["test"] >= 1
+    assert counts["valid"] >= 1
+
 
 def test_split_clusters_missing_file_raises(tmp_path: Path) -> None:
     with pytest.raises(FileNotFoundError, match="final_clusters.tsv"):
         split_clusters(tmp_path, "x")
 
 
-def test_split_clusters_single_cluster_goes_to_train(tmp_path: Path) -> None:
+def test_split_clusters_largest_eligible_clusters_go_to_eval(tmp_path: Path) -> None:
+    # Two 3-member clusters + six singletons; 3-member clusters should land in
+    # test and valid (largest-first), singletons fill train
+    rows = [
+        ("a0", "C000001"), ("a1", "C000001"), ("a2", "C000001"),
+        ("b0", "C000002"), ("b1", "C000002"), ("b2", "C000002"),
+    ]
+    rows += [(f"s{i}", f"C{i+3:06d}") for i in range(6)]
+    _write_clusters_tsv(tmp_path / "final_clusters.tsv", rows)
+
+    # 12 total small entries; test=0.25 → thresh=3, valid=0.25 → thresh=6
+    counts = split_clusters(tmp_path, "y", train=0.5, valid=0.25, test=0.25, seed=0)
+
+    test_lines = (tmp_path / "y_test.txt").read_text().splitlines()
+    valid_lines = (tmp_path / "y_valid.txt").read_text().splitlines()
+    train_lines = (tmp_path / "y_train.txt").read_text().splitlines()
+
+    # The two 3-member clusters fill exactly the test (3) and valid (3) quotas
+    assert counts["test"] == 3
+    assert counts["valid"] == 3
+    assert counts["train"] == 6
+
+    # 3-member clusters are in eval; singletons are in train
+    eval_ids = {line.removesuffix("_final") for line in test_lines + valid_lines}
+    assert {"a0", "a1", "a2"} <= eval_ids or {"b0", "b1", "b2"} <= eval_ids
+    train_ids = {line.removesuffix("_final") for line in train_lines}
+    assert all(f"s{i}" in train_ids for i in range(6))
+
+
+def test_split_clusters_single_cluster_goes_to_test(tmp_path: Path) -> None:
+    # With one cluster and test-first ordering, the single cluster fills test
     rows = [("a", "C000001"), ("b", "C000001")]
     _write_clusters_tsv(tmp_path / "final_clusters.tsv", rows)
 
     counts = split_clusters(tmp_path, "s", train=0.8, valid=0.1, test=0.1, seed=0)
 
-    assert counts["train"] == 2
+    assert counts["test"] == 2
     assert counts["valid"] == 0
-    assert counts["test"] == 0
+    assert counts["train"] == 0

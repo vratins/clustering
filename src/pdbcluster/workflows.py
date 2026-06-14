@@ -478,8 +478,13 @@ def split_clusters(
     """Partition entries from final_clusters.tsv into train/valid/test split files.
 
     Splitting is cluster-aware: all members of a cluster go to the same split.
-    Clusters with >= max_cluster_size members are always placed in train.
-    The ratios govern distribution of the remaining smaller clusters by entry count.
+    Clusters with >= max_cluster_size members are unconditionally placed in train.
+
+    The remaining clusters are sorted by size descending (seed breaks ties among
+    equal-size clusters). Test is filled first, then valid, then train receives
+    whatever remains — so the largest eligible clusters land in the eval sets and
+    small/singleton clusters pad the training set.
+
     Returns entry counts per split.
     """
     clusters_path = out_dir / "final_clusters.tsv"
@@ -496,7 +501,7 @@ def split_clusters(
     ratio_total = train + valid + test
     if ratio_total <= 0:
         raise ValueError("train + valid + test must be positive")
-    train_frac = train / ratio_total
+    test_frac = test / ratio_total
     valid_frac = valid / ratio_total
 
     small: list[str] = []
@@ -504,11 +509,14 @@ def split_clusters(
     for cluster_id, members in members_by_cluster.items():
         (large if len(members) >= max_cluster_size else small).append(cluster_id)
 
-    random.Random(seed).shuffle(small)
+    # Sort descending by size; seed-based tiebreak for equal-size clusters
+    rng = random.Random(seed)
+    tiebreak = {c: rng.random() for c in small}
+    small.sort(key=lambda c: (-len(members_by_cluster[c]), tiebreak[c]))
 
     total_small = sum(len(members_by_cluster[c]) for c in small)
-    train_thresh = total_small * train_frac
-    valid_thresh = total_small * (train_frac + valid_frac)
+    test_thresh = total_small * test_frac
+    valid_thresh = total_small * (test_frac + valid_frac)
 
     split_ids: dict[str, list[str]] = {"train": [], "valid": [], "test": []}
 
@@ -518,12 +526,12 @@ def split_clusters(
     cumulative = 0
     for cluster_id in small:
         members = members_by_cluster[cluster_id]
-        if cumulative < train_thresh:
-            split_key = "train"
+        if cumulative < test_thresh:
+            split_key = "test"
         elif cumulative < valid_thresh:
             split_key = "valid"
         else:
-            split_key = "test"
+            split_key = "train"
         cumulative += len(members)
         split_ids[split_key].extend(members)
 

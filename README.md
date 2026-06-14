@@ -107,14 +107,13 @@ Each line contains one PDB identifier in the form `<pdb_id>_final`.
 Splitting is **cluster-aware**: all members of the same cluster are always placed in
 the same split, preventing data leakage across sets. The `--train`/`--valid`/`--test`
 values are relative weights (not required to sum to 1.0, so `8 1 1` is equivalent to
-`0.8 0.1 0.1`). Weights govern distribution of entries across splits; the actual
-counts may differ slightly from the target ratios because entire clusters move
-together.
+`0.8 0.1 0.1`).
 
 Clusters with `>= --max-cluster-size` members (default 500) are unconditionally
-placed in the training set. The ratios then apply to the remaining smaller clusters.
-
-Pass `--seed` for a reproducible shuffle order.
+placed in the training set. The remaining clusters are sorted by size **descending**
+and assigned in test → valid → train order, so the largest eligible clusters land in
+the eval sets and small or singleton clusters fill the training set. `--seed` breaks
+ties among equal-size clusters and makes the assignment reproducible.
 
 ## Caching
 
